@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+prices.db
+*.bak_*
+.env
+.DS_Store
