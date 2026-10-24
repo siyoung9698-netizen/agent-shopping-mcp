@@ -347,7 +347,7 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
         lines.append(
             f"{i}. {p['name']} — {p['price']:,}원 ({p.get('mall') or ''})\n"
             f"   단백질 {_num_text(p.get('protein'), '%')} / 지방 {_num_text(p.get('fat'), '%')} / "
-            f"{_num_text(p.get('kcal'), 'kcal/kg')} / {gf} / 주원료: {ing} / {_score_text(p)}"
+            f"칼로리 {_num_text(p.get('kcal'), 'kcal/kg')} / {gf} / 주원료: {ing} / {_score_text(p)}"
         )
     return "\n".join(lines)
 
