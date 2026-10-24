@@ -1,9 +1,11 @@
 """에이전트용 최저가+타이밍 쇼핑 MCP 서버 (MVP)
 
 에이전트가 호출하는 도구:
-  - search_products  : 상품 검색 (네이버 쇼핑 API, 없으면 목업)
+  - search_products  : 상품 검색 (네이버 키가 있으면 쇼핑 API, 없으면 catalog.json)
   - check_price_timing: 지금 사기 좋은 타이밍인지 판단 (가격 히스토리 기반)
   - get_buy_link     : 어필리에이트 태그가 붙은 구매 링크 반환
+  - find_pet_food    : 펫 사료 조건 검색 (catalog.json의 pet_food)
+  - compare_nutrition: 두 사료 영양성분 비교 (같은 카탈로그)
 
 실행: .venv/bin/python server.py  (stdio 모드, MCP 클라이언트용)
 """
@@ -25,6 +27,71 @@ NAVER_ID = os.environ.get("NAVER_CLIENT_ID", "")
 NAVER_SECRET = os.environ.get("NAVER_CLIENT_SECRET", "")
 # 어필리에이트: 쿠팡 파트너스 ID 등을 여기에 넣으면 구매 링크에 자동 태깅
 AFFILIATE_ID = os.environ.get("AFFILIATE_ID", "")
+CATALOG_PATH = os.path.join(os.path.dirname(__file__), "catalog.json")
+# 검색 기본 경로는 영양제·펫푸드만. 전자제품 등 비버티컬 항목은 파일에 있어도 제외한다.
+_SEARCH_CATEGORIES = {"supplement", "pet_food"}
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def load_static_catalog(path: str = CATALOG_PATH):
+    """catalog.json을 한 번 읽어 상품 목록과 수동 갱신일을 반환한다."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    products = list(data.get("products") or [])
+    checked = data.get("checked_at") or ""
+    if not _DATE_RE.match(checked):
+        dates = [p.get("checked_at") for p in products if _DATE_RE.match(p.get("checked_at") or "")]
+        checked = max(dates) if dates else ""
+    return products, checked
+
+
+STATIC_PRODUCTS, STATIC_CHECKED_AT = load_static_catalog()
+
+
+def static_source_label() -> str:
+    """정적 파일 검색임을 밝히는 출처 문자열. 실시간 API로 보이지 않게 한다."""
+    if _DATE_RE.match(STATIC_CHECKED_AT or ""):
+        return f"static_catalog (수동 갱신 {STATIC_CHECKED_AT})"
+    return "static_catalog (수동 갱신 날짜없음)"
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", text).casefold()
+
+
+def _search_blob(product: dict) -> str:
+    parts = [product.get("name") or "", product.get("brand") or ""]
+    for kw in product.get("keywords") or []:
+        parts.append(str(kw))
+    return _compact(" ".join(parts))
+
+
+def _query_matches(blob: str, keyword: str) -> bool:
+    query = keyword.strip()
+    if not query:
+        return False
+    if _compact(query) in blob:
+        return True
+    tokens = [t for t in re.split(r"\s+", query) if t]
+    return len(tokens) > 1 and all(_compact(t) in blob for t in tokens)
+
+
+def _static_hits(keyword: str) -> list:
+    hits = []
+    for product in STATIC_PRODUCTS:
+        if product.get("category") not in _SEARCH_CATEGORIES:
+            continue
+        if not isinstance(product.get("price"), int):
+            continue
+        if _query_matches(_search_blob(product), keyword):
+            hits.append(product)
+    hits.sort(key=lambda p: p["price"])
+    return hits
+
+
+def pet_catalog() -> list:
+    """펫 도구가 보는 유일한 목록. search_products와 같은 catalog.json."""
+    return [p for p in STATIC_PRODUCTS if p.get("category") == "pet_food"]
 
 
 # ---------- 가격 히스토리 DB ----------
@@ -76,18 +143,15 @@ def product_key_of(name: str, mall: str) -> str:
 
 # ---------- 상품 검색 ----------
 
-MOCK_CATALOG = [
-    {"name": "종근당건강 락토핏 골드 2g x 50포", "price": 18900, "mall": "쿠팡",
-     "url": "https://www.coupang.com/", "rating": 4.8, "reviews": 152340},
-    {"name": "뉴트리원 루테인 지아잔틴 30캡슐", "price": 24900, "mall": "네이버쇼핑",
-     "url": "https://shopping.naver.com/", "rating": 4.7, "reviews": 89312},
-    {"name": "닥터린 초임계 알티지 오메가3 60캡슐", "price": 32900, "mall": "쿠팡",
-     "url": "https://www.coupang.com/", "rating": 4.8, "reviews": 67410},
-    {"name": "고려은단 비타민C 1000mg 180정", "price": 15900, "mall": "11번가",
-     "url": "https://www.11st.co.kr/", "rating": 4.9, "reviews": 210555},
-    {"name": "삼성전자 갤럭시 버즈3 프로", "price": 279000, "mall": "네이버쇼핑",
-     "url": "https://shopping.naver.com/", "rating": 4.6, "reviews": 12304},
-]
+def _hit_suffix(product: dict) -> str:
+    bits = []
+    if product.get("rating") is not None:
+        bits.append(f"★{product['rating']}")
+    if isinstance(product.get("reviews"), int):
+        bits.append(f"리뷰 {product['reviews']:,}개")
+    if _DATE_RE.match(product.get("checked_at") or ""):
+        bits.append(f"확인 {product['checked_at']}")
+    return (" " + " ".join(bits)) if bits else ""
 
 
 def naver_search(keyword: str, limit: int):
@@ -115,7 +179,10 @@ def naver_search(keyword: str, limit: int):
 
 @mcp.tool()
 def search_products(keyword: str, limit: int = 10) -> str:
-    """상품을 검색하고 최저가 순으로 반환. 호출될 때마다 가격을 히스토리에 기록한다."""
+    """상품을 검색하고 최저가 순으로 반환. 호출될 때마다 가격을 히스토리에 기록한다.
+
+    네이버 키가 없으면 catalog.json(영양제·펫푸드)을 상품명·키워드로 검색한다.
+    출처는 static_catalog이며 실시간 검색이 아니다."""
     limit = max(1, min(limit, 20))
     if NAVER_ID and NAVER_SECRET:
         try:
@@ -124,10 +191,9 @@ def search_products(keyword: str, limit: int = 10) -> str:
         except Exception as e:
             return f"네이버 쇼핑 API 오류: {e}"
     else:
-        items = [p for p in MOCK_CATALOG if keyword.replace(" ", "") in p["name"].replace(" ", "")][:limit]
-        if not items:
-            items = MOCK_CATALOG[:limit]
-        source = "mock (NAVER_CLIENT_ID/SECRET 미설정)"
+        # 맞는 상품이 없어도 다른 카테고리로 채우지 않는다.
+        items = _static_hits(keyword)[:limit]
+        source = static_source_label()
 
     for p in items:
         if p["price"]:
@@ -135,13 +201,14 @@ def search_products(keyword: str, limit: int = 10) -> str:
 
     items_sorted = sorted(items, key=lambda x: x["price"] or 10**18)
     lines = [f"[검색: {keyword}] (출처: {source})"]
+    if not items_sorted:
+        lines.append("맞는 상품이 없어.")
+        return "\n".join(lines)
     for i, p in enumerate(items_sorted, 1):
-        lines.append(
-            f"{i}. {p['name']} — {p['price']:,}원 ({p['mall']})"
-            + (f" ★{p['rating']} 리뷰 {p['reviews']:,}개" if p.get("rating") else "")
-        )
-    if items_sorted and items_sorted[0]["price"]:
-        lines.append(f"\n최저가: {items_sorted[0]['price']:,}원 ({items_sorted[0]['mall']})")
+        mall = p.get("mall") or ""
+        lines.append(f"{i}. {p['name']} — {p['price']:,}원 ({mall}){_hit_suffix(p)}")
+    if items_sorted[0]["price"]:
+        lines.append(f"\n최저가: {items_sorted[0]['price']:,}원 ({items_sorted[0].get('mall') or ''})")
     return "\n".join(lines)
 
 
@@ -185,24 +252,64 @@ def get_buy_link(product_url: str, product_name: str = "") -> str:
 
 # ---------- 펫 버티컬 확장 ----------
 
-PET_CATALOG = [
-    {"name": "오리젠 오리지날 독 2kg", "brand": "오리젠", "pet": "강아지", "age": "전연령",
-     "price": 42000, "mall": "쿠팡", "url": "https://www.coupang.com/",
-     "protein": 38.0, "fat": 18.0, "kcal": 3860, "main_ingredients": ["닭고기", "칠면조", "청어"],
-     "grain_free": True, "allergens": [], "rating": 4.8, "reviews": 12480},
-    {"name": "로얄캐닌 미니 어덜트 2kg", "brand": "로얄캐닌", "pet": "강아지", "age": "어덜트",
-     "price": 28500, "mall": "네이버쇼핑", "url": "https://shopping.naver.com/",
-     "protein": 27.0, "fat": 16.0, "kcal": 3650, "main_ingredients": ["쌀", "닭고기", "옥수수"],
-     "grain_free": False, "allergens": ["곡물"], "rating": 4.7, "reviews": 45230},
-    {"name": "아카나 와일드 코스트 캣 1.8kg", "brand": "아카나", "pet": "고양이", "age": "전연령",
-     "price": 39500, "mall": "쿠팡", "url": "https://www.coupang.com/",
-     "protein": 37.0, "fat": 20.0, "kcal": 3930, "main_ingredients": ["청어", "넙치", "은대구"],
-     "grain_free": True, "allergens": [], "rating": 4.8, "reviews": 8930},
-    {"name": "내추럴발란스 오리지널 울트라 캣 2.27kg", "brand": "내추럴발란스", "pet": "고양이",
-     "age": "전연령", "price": 31000, "mall": "11번가", "url": "https://www.11st.co.kr/",
-     "protein": 34.0, "fat": 18.0, "kcal": 3740, "main_ingredients": ["닭고기", "연어", "오트밀"],
-     "grain_free": False, "allergens": [], "rating": 4.6, "reviews": 15620},
-]
+def _age_ok(product_age: str, query: str) -> bool:
+    """카탈로그 연령(퍼피/키튼/성견/성묘/시니어)과 질의 연령을 맞춘다.
+
+    '어덜트'는 성견·성묘를 함께 가리킨다. '전연령' 상품은 어떤 연령 필터에도 남긴다.
+    """
+    if not query:
+        return True
+    age = (product_age or "").strip()
+    q = query.strip()
+    if age == "전연령" or q == "전연령":
+        return True
+    if q == "어덜트":
+        return age in {"성견", "성묘", "어덜트"}
+    if q in {"성견", "성묘"}:
+        return age == q or age == "어덜트"
+    return age == q
+
+
+def _num_text(value, suffix: str) -> str:
+    if not isinstance(value, (int, float)):
+        return "미확인"
+    return f"{value}{suffix}"
+
+
+def _score_text(product: dict) -> str:
+    rating = product.get("rating")
+    reviews = product.get("reviews")
+    if rating is not None and isinstance(reviews, int):
+        return f"★{rating} ({reviews:,}개)"
+    if rating is not None:
+        return f"★{rating}"
+    if isinstance(reviews, int):
+        return f"리뷰 {reviews:,}개"
+    return "평점 미확인"
+
+
+def _pet_sort_key(sort_by: str):
+    if sort_by == "price":
+        return lambda p: (p.get("price") is None, p.get("price") or 0)
+    if sort_by == "rating":
+        return lambda p: (p.get("rating") is None, -(p.get("rating") or 0), p.get("price") or 0)
+    return lambda p: (p.get("protein") is None, -(p.get("protein") or 0), p.get("price") or 0)
+
+
+def _find_pet_product(query: str):
+    compact = _compact(query)
+    if not compact:
+        return None
+    hits = []
+    for product in pet_catalog():
+        name = _compact(product.get("name") or "")
+        pid = _compact(product.get("id") or "")
+        if compact in name or compact == pid:
+            hits.append(product)
+    if not hits:
+        return None
+    hits.sort(key=lambda p: len(p.get("name") or ""))
+    return hits[0]
 
 
 @mcp.tool()
@@ -210,64 +317,80 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
                   grain_free_only: bool = False, max_price: int = 0,
                   sort_by: str = "protein") -> str:
     """반려동물 사료를 조건으로 검색. pet='강아지'|'고양이'.
-    sort_by: 'protein'(단백질순) | 'price'(낮은가격순) | 'rating'(평점순)"""
-    results = [p for p in PET_CATALOG if p["pet"] == pet]
-    if age:
-        results = [p for p in results if p["age"] in (age, "전연령")]
+    age: '퍼피'|'키튼'|'성견'|'성묘'|'시니어'|'어덜트'(성견·성묘).
+    sort_by: 'protein'(단백질순) | 'price'(낮은가격순) | 'rating'(평점순).
+    영양 수치가 카탈로그에 없으면 미확인으로 표시하고 가격순으로 넘긴다."""
+    pet = pet.strip()
+    results = [p for p in pet_catalog() if p.get("pet") == pet]
+    results = [p for p in results if _age_ok(p.get("age") or "", age)]
     if exclude_allergen:
-        results = [p for p in results if exclude_allergen not in p["allergens"]]
+        results = [p for p in results if exclude_allergen not in (p.get("allergens") or [])]
     if grain_free_only:
-        results = [p for p in results if p["grain_free"]]
+        results = [p for p in results if p.get("grain_free")]
     if max_price:
-        results = [p for p in results if p["price"] <= max_price]
+        results = [p for p in results if isinstance(p.get("price"), int) and p["price"] <= max_price]
 
-    key = {"protein": lambda x: -x["protein"], "price": lambda x: x["price"],
-           "rating": lambda x: -x["rating"]}.get(sort_by, lambda x: -x["protein"])
-    results.sort(key=key)
+    results.sort(key=_pet_sort_key(sort_by))
 
     for p in results:
-        log_price(product_key_of(p["name"], p["mall"]), p["name"], p["price"], p["mall"])
+        if isinstance(p.get("price"), int) and p["price"]:
+            log_price(product_key_of(p["name"], p.get("mall") or ""), p["name"], p["price"], p.get("mall") or "")
 
+    source = static_source_label()
     if not results:
-        return "조건에 맞는 사료가 없어. 조건을 완화해봐."
-    lines = [f"[펫사료 검색: {pet} / {len(results)}건]"]
+        return f"조건에 맞는 사료가 없어. 조건을 완화해봐. (출처: {source})"
+    lines = [f"[펫사료 검색: {pet} / {len(results)}건] (출처: {source})"]
     for i, p in enumerate(results, 1):
-        gf = "그레인프리" if p["grain_free"] else "곡물포함"
+        gf = "그레인프리" if p.get("grain_free") else "곡물포함"
+        ingredients = p.get("main_ingredients") or []
+        ing = ", ".join(ingredients) if ingredients else "미확인"
         lines.append(
-            f"{i}. {p['name']} — {p['price']:,}원 ({p['mall']})\n"
-            f"   단백질 {p['protein']}% / 지방 {p['fat']}% / {p['kcal']}kcal/kg / {gf} / "
-            f"주원료: {', '.join(p['main_ingredients'])} / ★{p['rating']} ({p['reviews']:,}개)"
+            f"{i}. {p['name']} — {p['price']:,}원 ({p.get('mall') or ''})\n"
+            f"   단백질 {_num_text(p.get('protein'), '%')} / 지방 {_num_text(p.get('fat'), '%')} / "
+            f"{_num_text(p.get('kcal'), 'kcal/kg')} / {gf} / 주원료: {ing} / {_score_text(p)}"
         )
     return "\n".join(lines)
 
 
 @mcp.tool()
 def compare_nutrition(product_a: str, product_b: str) -> str:
-    """두 사료의 영양성분을 나란히 비교."""
-    def find(q):
-        q = q.replace(" ", "")
-        for p in PET_CATALOG:
-            if q in p["name"].replace(" ", ""):
-                return p
-        return None
-    a, b = find(product_a), find(product_b)
+    """두 사료의 영양성분을 나란히 비교. 수치는 catalog.json에 있는 값만 쓴다."""
+    a, b = _find_pet_product(product_a), _find_pet_product(product_b)
+    source = static_source_label()
     if not a or not b:
-        return "상품을 못 찾았어. find_pet_food로 먼저 검색해봐."
+        return f"상품을 못 찾았어. find_pet_food로 먼저 검색해봐. (출처: {source})"
+
+    def price_text(p):
+        return f"{p['price']:,}원" if isinstance(p.get("price"), int) else "미확인"
+
     rows = [
-        ("가격", f"{a['price']:,}원", f"{b['price']:,}원"),
-        ("단백질", f"{a['protein']}%", f"{b['protein']}%"),
-        ("지방", f"{a['fat']}%", f"{b['fat']}%"),
-        ("칼로리", f"{a['kcal']}kcal/kg", f"{b['kcal']}kcal/kg"),
-        ("그레인프리", "O" if a["grain_free"] else "X", "O" if b["grain_free"] else "X"),
-        ("평점", f"★{a['rating']} ({a['reviews']:,}개)", f"★{b['rating']} ({b['reviews']:,}개)"),
+        ("가격", price_text(a), price_text(b)),
+        ("단백질", _num_text(a.get("protein"), "%"), _num_text(b.get("protein"), "%")),
+        ("지방", _num_text(a.get("fat"), "%"), _num_text(b.get("fat"), "%")),
+        ("칼로리", _num_text(a.get("kcal"), "kcal/kg"), _num_text(b.get("kcal"), "kcal/kg")),
+        ("그레인프리", "O" if a.get("grain_free") else "X", "O" if b.get("grain_free") else "X"),
+        ("평점", _score_text(a), _score_text(b)),
     ]
-    lines = [f"[영양성분 비교]\n항목 | {a['name'][:20]} | {b['name'][:20]}"]
-    for r in rows:
-        lines.append(f"{r[0]} | {r[1]} | {r[2]}")
-    # 간단 총평
-    better_protein = a["name"] if a["protein"] > b["protein"] else b["name"]
-    cheaper = a["name"] if a["price"] < b["price"] else b["name"]
-    lines.append(f"\n단백질 함량은 '{better_protein[:20]}'이 높고, 가격은 '{cheaper[:20]}'이 저렴해.")
+    lines = [
+        f"[영양성분 비교] (출처: {source})",
+        f"항목 | {a['name'][:20]} | {b['name'][:20]}",
+    ]
+    for row in rows:
+        lines.append(f"{row[0]} | {row[1]} | {row[2]}")
+    pa, pb = a.get("protein"), b.get("protein")
+    if isinstance(pa, (int, float)) and isinstance(pb, (int, float)) and pa != pb:
+        richer = a if pa > pb else b
+        protein_note = f"단백질 함량은 '{richer['name'][:20]}'이 높아."
+    elif isinstance(pa, (int, float)) and isinstance(pb, (int, float)):
+        protein_note = "단백질 함량은 같아."
+    else:
+        protein_note = "단백질 수치는 카탈로그에 없어."
+    if isinstance(a.get("price"), int) and isinstance(b.get("price"), int) and a["price"] != b["price"]:
+        cheaper = a if a["price"] < b["price"] else b
+        price_note = f"가격은 '{cheaper['name'][:20]}'이 저렴해."
+    else:
+        price_note = ""
+    lines.append("\n" + " ".join(part for part in (protein_note, price_note) if part))
     return "\n".join(lines)
 
 
