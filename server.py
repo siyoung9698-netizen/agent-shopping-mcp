@@ -280,4 +280,19 @@ if __name__ == "__main__":
         # (FastMCP 생성자 기본값이 환경변수보다 우선 적용되므로 여기서 직접 덮어씀)
         mcp.settings.host = os.environ.get("HOST", "0.0.0.0")
         mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        # 주의: FastMCP는 생성 시점 host가 localhost면 DNS 리바인딩 보호를 켜고
+        # 허용 호스트를 localhost로 고정한다. host만 0.0.0.0으로 바꿔서는 Render
+        # 공개 호스트 요청이 421 Misdirected Request로 막히므로 허용 호스트도
+        # 함께 갱신해야 한다. (Render 서비스명을 바꾸면 아래 호스트도 바꿀 것)
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "agent-shopping-mcp.onrender.com",
+                "agent-shopping-mcp.onrender.com:*",
+                "localhost:*",
+                "127.0.0.1:*",
+            ],
+        )
     mcp.run(transport=transport)
