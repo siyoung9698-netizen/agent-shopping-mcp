@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 prices.db
+usage.db
+usage.db-wal
+usage.db-shm
 *.bak_*
 .env
 .DS_Store
