@@ -26,7 +26,7 @@
 | 요금 | $0 — 월 750시간, 카드 등록 불필요 |
 | 조건 | 15분 무응답 시 슬립, 첫 호출에 약 1분 소요 |
 | 대역폭 | 월 5GB (이 용도로는 충분) |
-| DB | prices.db(SQLite)는 재배포/재시작 시 초기화됨 — MVP 단계에서는 감수 |
+| DB | prices.db·usage.db(SQLite)는 재배포/재시작 시 초기화됨 — MVP 단계에서는 감수 |
 
 **배포 순서**
 1. GitHub에 이 폴더 push (prices.db, .bak 파일, __pycache__ 제외)
@@ -36,7 +36,19 @@
 5. Environment Variables:
    - `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` (네이버 개발자센터에서 검색 API 발급)
    - `AFFILIATE_ID` (쿠팡 파트너스 ID — 나중에)
-6. 배포 후 `https://<서비스명>.onrender.com/mcp` 가 MCP 엔드포인트
+   - `MCP_API_KEYS` (쉼표로 구분한 허용 API 키. 예: 시험용 `dev-demo-key`)
+   - `MCP_MONTHLY_QUOTA` (키별 지정가 없는 키의 UTC 월간 한도. 생략 시 1000)
+   - `MCP_KEY_QUOTAS` (선택, `키:한도` 를 쉼표로 연결. 예: `dev-demo-key:100`)
+   - `MCP_USAGE_DB_PATH` (선택. 생략 시 앱 디렉터리 `usage.db`. 무료 디스크는 재시작 시 삭제)
+   - `MCP_API_KEY`는 넣지 않는다. 로컬 stdio 전용이라 HTTP 호출자를 인증하지 않는다.
+6. 값을 저장한 뒤 수동 배포 또는 재시작해야 프로세스에 반영된다.
+7. 배포 후
+   - MCP: `https://<서비스명>.onrender.com/mcp`
+   - 헬스: `GET https://<서비스명>.onrender.com/health`
+   - 사용량: `GET https://<서비스명>.onrender.com/usage` + `Authorization: Bearer <키>`
+     (헤더가 어려우면 `?api_key=<키>`)
+
+키를 클라이언트에 넣는 방법과 "1콜"의 정의는 README의 "API 키와 호출 미터링"을 본다.
 
 **슬립 이슈**: PlayMCP 경유 첫 호출이 1분 걸리면 타임아웃 날 수 있음.
 MVP 테스트 단계에서는 감수하고, 실제 트래픽 붙으면
