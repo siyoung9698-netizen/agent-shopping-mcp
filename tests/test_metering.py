@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import socket
@@ -155,6 +156,67 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
             read_timeout_seconds=timedelta(seconds=10),
             raise_exceptions=True,
         )
+
+    async def test_every_tool_lists_full_annotations(self):
+        """PlayMCP는 tools/list의 annotations에 title과 네 hint가 모두 있어야 한다."""
+        expected = {
+            "search_products": {
+                "title": "상품 검색",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": True,
+            },
+            "check_price_timing": {
+                "title": "가격 타이밍",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+            "get_buy_link": {
+                "title": "구매 링크",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+            "find_pet_food": {
+                "title": "펫사료 검색",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+            "compare_nutrition": {
+                "title": "영양성분 비교",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+            "get_usage": {
+                "title": "사용량 조회",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        }
+        async with self._session() as client:
+            listed = await client.list_tools()
+        by_name = {tool.name: tool for tool in listed.tools}
+        self.assertEqual(set(by_name), set(expected))
+        for name, want in expected.items():
+            tool = by_name[name]
+            annotations = tool.annotations
+            self.assertIsNotNone(annotations, name)
+            dumped = annotations.model_dump(exclude_none=True)
+            self.assertEqual(dumped, want, name)
+            description = inspect.getdoc(getattr(server, name))
+            self.assertTrue(description, name)
+            self.assertEqual(tool.description, description, name)
+            self.assertNotRegex(description, r"\n[ \t]+\S", name)
 
     async def test_valid_key_increments_and_get_usage_matches(self):
         async with self._session() as client:

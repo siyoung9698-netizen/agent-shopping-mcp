@@ -292,13 +292,44 @@ def naver_search(keyword: str, limit: int):
     return items
 
 
-@mcp.tool()
+def _listed(annotations: ToolAnnotations):
+    """docstring을 들여쓰기 없이 도구 설명으로 등록한다.
+
+    PlayMCP는 등록 시점의 설명을 캐시하므로, 설명은 이 docstring이 기준이다.
+    """
+
+    def decorate(func):
+        return mcp.tool(description=inspect.getdoc(func) or "", annotations=annotations)(func)
+
+    return decorate
+
+
+# 힌트는 사용자 환경이나 외부 시스템이 바뀌는지를 본다.
+# 사용량 카운터와 가격 히스토리는 서버 내부 기록이라 읽기 전용·멱등이다.
+# 외부 API를 호출할 수 있는 도구는 search_products(네이버 쇼핑)뿐이다.
+@_listed(
+    ToolAnnotations(
+        title="상품 검색",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
 @metered
 def search_products(keyword: str, limit: int = 10) -> str:
-    """상품을 검색하고 최저가 순으로 반환. 호출될 때마다 가격을 히스토리에 기록한다.
+    """상품을 검색해 가격이 낮은 순으로 돌려준다.
 
-    네이버 키가 없으면 catalog.json(영양제·펫푸드)을 상품명·키워드로 검색한다.
-    출처는 static_catalog이며 실시간 검색이 아니다."""
+    네이버 쇼핑 API의 클라이언트 ID와 시크릿이 둘 다 있으면 네이버 쇼핑 검색을
+    호출한다. 그렇지 않으면 catalog.json의 영양제와 펫푸드만 상품명, 브랜드,
+    키워드로 찾고, 응답에 static_catalog 출처를 붙인다. 그 결과는 실시간
+    가격이 아니다. 네이버 호출이 실패하면 오류 문장을 돌려주고 카탈로그로
+    바꾸지 않는다. 맞는 상품이 없으면 다른 상품으로 채우지 않는다.
+
+    keyword는 검색어다. limit는 돌려줄 최대 건수이며 기본값은 10이고, 1보다
+    작거나 20보다 크면 그 경계로 맞춘다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나,
+    등록되지 않았거나, 이번 달 한도를 넘기면 상품 결과 대신 오류 JSON을
+    돌려주며, 그 호출은 집계되지 않는다."""
     limit = max(1, min(limit, 20))
     if NAVER_ID and NAVER_SECRET:
         try:
@@ -328,10 +359,29 @@ def search_products(keyword: str, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_listed(
+    ToolAnnotations(
+        title="가격 타이밍",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 @metered
 def check_price_timing(product_name: str, mall: str = "") -> str:
-    """지금 사기 좋은 타이밍인지 판단. 최근 90일 히스토리와 비교한다."""
+    """이 서버에 쌓여 있는 최근 90일 가격과 비교해 지금 사기 좋은 타이밍인지 판단한다.
+
+    비교에 쓰는 가격은 이 서버가 앞서 검색하며 남겨 둔 기록이다. 외부 가격
+    API는 호출하지 않는다. 기록이 2건 미만이면 판단을 보류하고 현재 건수를
+    알린다. 기록이 충분하면 현재가, 90일 최저가, 평균, 그리고 한 줄 결론을
+    돌려준다. 현재가가 최저가의 102% 이하면 최저가 수준, 평균 이하면 평균보다
+    싼 편, 평균보다 비싸면 그 비율을 말한다.
+
+    product_name은 상품명이고 mall은 판매처다. mall을 비우면 판매처가 비어
+    있는 기록만 본다. 상품명에서는 한글, 영문, 숫자만 남기고 앞 30자로 기록을
+    찾는다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를
+    넘기면 판단 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
     key = product_key_of(product_name, mall)
     st = price_stats(key)
     if not st or st["count"] < 2:
@@ -354,10 +404,25 @@ def check_price_timing(product_name: str, mall: str = "") -> str:
     )
 
 
-@mcp.tool()
+@_listed(
+    ToolAnnotations(
+        title="구매 링크",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 @metered
 def get_buy_link(product_url: str, product_name: str = "") -> str:
-    """구매 링크 반환. AFFILIATE_ID가 설정되어 있으면 어필리에이트 태그를 붙인다."""
+    """받은 상품 주소의 구매 링크를 돌려준다. 페이지를 열거나 결제하지 않는다.
+
+    주소에 coupang.com이 들어 있고 서버에 어필리에이트 ID가 있으면 partner_id
+    쿼리를 붙인다. 그렇지 않으면 받은 주소를 그대로 돌려준다.
+
+    product_url은 상품 주소다. product_name은 선택이며 링크 내용에 반영되지
+    않는다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를
+    넘기면 링크 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
     url = product_url
     note = "어필리에이트 미설정 — 원본 링크 반환"
     if AFFILIATE_ID and "coupang.com" in url:
@@ -430,15 +495,35 @@ def _find_pet_product(query: str):
     return hits[0]
 
 
-@mcp.tool()
+@_listed(
+    ToolAnnotations(
+        title="펫사료 검색",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 @metered
 def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
                   grain_free_only: bool = False, max_price: int = 0,
                   sort_by: str = "protein") -> str:
-    """반려동물 사료를 조건으로 검색. pet='강아지'|'고양이'.
-    age: '퍼피'|'키튼'|'성견'|'성묘'|'시니어'|'어덜트'(성견·성묘).
-    sort_by: 'protein'(단백질순) | 'price'(낮은가격순) | 'rating'(평점순).
-    영양 수치가 카탈로그에 없으면 미확인으로 표시하고 가격순으로 넘긴다."""
+    """catalog.json의 펫푸드를 조건으로 걸러 돌려준다. 외부 API는 호출하지 않는다.
+
+    가격과 영양 수치는 카탈로그에 있는 값만 쓰고, 없으면 미확인으로 표시한다.
+    조건에 맞는 상품이 없으면 그렇게 알린다.
+
+    pet은 강아지 또는 고양이다. age는 퍼피, 키튼, 성견, 성묘, 시니어, 어덜트,
+    전연령 중 하나이며 비우면 연령으로 거르지 않는다. 어덜트는 성견과 성묘를
+    함께 가리킨다. age에 전연령을 주면 연령과 상관없이 모두 남고, 상품 연령이
+    전연령이면 어떤 연령 필터에도 남는다.
+    exclude_allergen에 준 문자열이 상품의 알레르기 원료 목록에 있으면 그
+    상품을 빼며, 비우면 제외하지 않는다. grain_free_only가 참이면 그레인프리만
+    남긴다. max_price가 0이면 가격 제한이 없고, 다른 값이면 그 금액 이하만
+    남긴다. sort_by는 protein(단백질이 높은 순, 기본값), price(가격이 낮은 순),
+    rating(평점이 높은 순)이다. 그 밖의 값은 protein과 같이 단백질이 높은 순이다.
+    호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를 넘기면
+    목록 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
     pet = pet.strip()
     results = [p for p in pet_catalog() if p.get("pet") == pet]
     results = [p for p in results if _age_ok(p.get("age") or "", age)]
@@ -471,10 +556,27 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_listed(
+    ToolAnnotations(
+        title="영양성분 비교",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 @metered
 def compare_nutrition(product_a: str, product_b: str) -> str:
-    """두 사료의 영양성분을 나란히 비교. 수치는 catalog.json에 있는 값만 쓴다."""
+    """catalog.json에 있는 두 펫푸드의 가격, 단백질, 지방, 칼로리, 그레인프리 여부, 평점을 나란히 비교한다.
+
+    카탈로그에 없는 수치는 만들지 않고 미확인으로 둔다. 외부 API는 호출하지
+    않는다.
+
+    product_a와 product_b는 상품명 일부 또는 상품 id다. 공백을 없애고
+    대소문자를 가리지 않은 뒤, 상품명에 포함되거나 id가 같으면 찾는다. 여러
+    개면 이름이 더 짧은 상품을 고른다. 둘 중 하나라도 없으면 찾지 못했다고
+    알린다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를
+    넘기면 비교 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
     a, b = _find_pet_product(product_a), _find_pet_product(product_b)
     source = static_source_label()
     if not a or not b:
@@ -514,14 +616,24 @@ def compare_nutrition(product_a: str, product_b: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="사용량 조회", readOnlyHint=True))
+@_listed(
+    ToolAnnotations(
+        title="사용량 조회",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 @metered(consume=False)
 def get_usage() -> str:
-    """이 API 키의 이번 달 호출 수, 남은 한도, 초기화 시각을 반환한다.
+    """이 요청의 API 키에 대한 이번 달 사용량만 JSON으로 돌려준다.
 
-    검색·비교·구매 링크 도구와 달리 이 호출은 사용량에 포함되지 않는다.
-    다른 키의 사용량은 반환하지 않는다.
-    """
+    호출 수, 남은 횟수, 월간 한도, UTC 달력 월, 다음 초기화 시각(UTC), 집계되는
+    도구 목록이 들어 있다. 키 원문은 없고 짧은 key_id만 있으며, 다른 키의
+    사용량은 들어 있지 않다.
+    이 조회는 호출 수에 포함되지 않는다. 인자는 없다. 호출 키가 없거나
+    등록되지 않으면 오류 JSON을 돌려준다. 한도를 넘긴 상태에서도 조회는 된다."""
     view = _caller_view.get()
     if view is None:
         raise RuntimeError("사용량 컨텍스트가 없습니다.")
