@@ -33,7 +33,17 @@ import metering
 # .env는 이미 설정된 환경변수(Render 등)를 덮어쓰지 않는다.
 metering.load_local_env()
 
-mcp = FastMCP("agent-shopping")
+# Stateless: each HTTP request is its own session, so clients do not send Mcp-Session-Id.
+# The MCP server id stays "agent-shopping". The public service name is the pair below.
+mcp = FastMCP("agent-shopping", stateless_http=True)
+
+# PlayMCP requires every tool description to include the service name in English
+# and Korean, as in "from BuyWhen(뭐살까? 언제살까?)". These two constants are
+# the only place that name is defined.
+SERVICE_NAME_EN = "BuyWhen"
+SERVICE_NAME_KO = "뭐살까? 언제살까?"
+MAX_TOOL_RESPONSE_CHARS = 24_000
+_TRUNCATION_NOTE = "\n[truncated]"
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "prices.db")
 NAVER_ID = os.environ.get("NAVER_CLIENT_ID", "")
@@ -149,13 +159,76 @@ def _tool_error(err: metering.MeterError, tool_name: str) -> CallToolResult:
     )
 
 
-def _json_response(payload: dict, status_code: int = 200) -> Response:
+def _json_response(
+    payload: dict,
+    status_code: int = 200,
+    extra_headers: dict[str, str] | None = None,
+) -> Response:
+    headers = {"cache-control": "no-store"}
+    if extra_headers:
+        headers.update(extra_headers)
     return Response(
         content=json.dumps(payload, ensure_ascii=False),
         status_code=status_code,
         media_type="application/json; charset=utf-8",
-        headers={"cache-control": "no-store"},
+        headers=headers,
     )
+
+
+def service_from_clause() -> str:
+    """PlayMCP attribution, for example from BuyWhen(뭐살까? 언제살까?)."""
+    return f"from {SERVICE_NAME_EN}({SERVICE_NAME_KO})"
+
+
+def render_tool_description(func) -> str:
+    """Fill {service} from SERVICE_NAME_EN / SERVICE_NAME_KO and keep the 1024 cap."""
+    clause = service_from_clause()
+    text = (inspect.getdoc(func) or "").replace("{service}", clause).strip()
+    if clause not in text:
+        text = f"{text}\n\nResults {clause}.".strip()
+    if len(text) > 1024:
+        raise ValueError(
+            f"{getattr(func, '__name__', 'tool')} description is {len(text)} characters; PlayMCP allows 1024."
+        )
+    return text
+
+
+def limit_tool_text(text: str) -> str:
+    """Keep a tool result within PlayMCP's 24,000-character response limit."""
+    limit = MAX_TOOL_RESPONSE_CHARS
+    if len(text) <= limit:
+        return text
+    note = _TRUNCATION_NOTE
+    if len(note) >= limit:
+        return text[:limit]
+    budget = limit - len(note)
+    clipped = text[:budget]
+    newline = clipped.rfind("\n")
+    if newline >= budget // 2:
+        clipped = clipped[:newline]
+    return clipped + note
+
+
+def limit_tool_output(value):
+    if isinstance(value, str):
+        return limit_tool_text(value)
+    if isinstance(value, CallToolResult):
+        content = []
+        for block in value.content:
+            if isinstance(block, TextContent):
+                content.append(TextContent(type="text", text=limit_tool_text(block.text)))
+            else:
+                content.append(block)
+        structured = value.structuredContent
+        if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+            structured = dict(structured)
+            structured["result"] = limit_tool_text(structured["result"])
+        return CallToolResult(
+            content=content,
+            structuredContent=structured,
+            isError=value.isError,
+        )
+    return value
 
 
 def metered(fn=None, *, consume: bool = True):
@@ -179,10 +252,10 @@ def metered(fn=None, *, consume: bool = True):
             async def wrapper(*args, **kwargs):
                 gated = gate(kwargs)
                 if isinstance(gated, CallToolResult):
-                    return gated
+                    return limit_tool_output(gated)
                 token = _caller_view.set(gated)
                 try:
-                    return await func(*args, **kwargs)
+                    return limit_tool_output(await func(*args, **kwargs))
                 finally:
                     _caller_view.reset(token)
 
@@ -192,16 +265,17 @@ def metered(fn=None, *, consume: bool = True):
             def wrapper(*args, **kwargs):
                 gated = gate(kwargs)
                 if isinstance(gated, CallToolResult):
-                    return gated
+                    return limit_tool_output(gated)
                 token = _caller_view.set(gated)
                 try:
-                    return func(*args, **kwargs)
+                    return limit_tool_output(func(*args, **kwargs))
                 finally:
                     _caller_view.reset(token)
 
         annotations = dict(getattr(func, "__annotations__", {}))
         annotations["ctx"] = Context
         wrapper.__annotations__ = annotations
+        wrapper._requires_api_key = True
         return wrapper
 
     if fn is None:
@@ -299,7 +373,9 @@ def _listed(annotations: ToolAnnotations):
     """
 
     def decorate(func):
-        return mcp.tool(description=inspect.getdoc(func) or "", annotations=annotations)(func)
+        description = render_tool_description(func)
+        func.__doc__ = description
+        return mcp.tool(description=description, annotations=annotations)(func)
 
     return decorate
 
@@ -318,18 +394,11 @@ def _listed(annotations: ToolAnnotations):
 )
 @metered
 def search_products(keyword: str, limit: int = 10) -> str:
-    """상품을 검색해 가격이 낮은 순으로 돌려준다.
+    """Search products and return the matches {service}, lowest price first.
 
-    네이버 쇼핑 API의 클라이언트 ID와 시크릿이 둘 다 있으면 네이버 쇼핑 검색을
-    호출한다. 그렇지 않으면 catalog.json의 영양제와 펫푸드만 상품명, 브랜드,
-    키워드로 찾고, 응답에 static_catalog 출처를 붙인다. 그 결과는 실시간
-    가격이 아니다. 네이버 호출이 실패하면 오류 문장을 돌려주고 카탈로그로
-    바꾸지 않는다. 맞는 상품이 없으면 다른 상품으로 채우지 않는다.
+    When both Naver Shopping API credentials are set, this calls Naver Shopping. If that call fails, the error is returned and the catalog is not used as a fallback. Otherwise it searches catalog.json for supplements and pet food by product name, brand, and keywords, and labels the source as static_catalog. Those prices are not live. If nothing matches, the result is not filled with other products.
 
-    keyword는 검색어다. limit는 돌려줄 최대 건수이며 기본값은 10이고, 1보다
-    작거나 20보다 크면 그 경계로 맞춘다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나,
-    등록되지 않았거나, 이번 달 한도를 넘기면 상품 결과 대신 오류 JSON을
-    돌려주며, 그 호출은 집계되지 않는다."""
+    keyword is the query. limit is the maximum number of results, default 10, clamped to 1 through 20. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     limit = max(1, min(limit, 20))
     if NAVER_ID and NAVER_SECRET:
         try:
@@ -370,18 +439,11 @@ def search_products(keyword: str, limit: int = 10) -> str:
 )
 @metered
 def check_price_timing(product_name: str, mall: str = "") -> str:
-    """이 서버에 쌓여 있는 최근 90일 가격과 비교해 지금 사기 좋은 타이밍인지 판단한다.
+    """Compare the latest stored price with this server's recent history {service} and say whether it is low, typical, or high.
 
-    비교에 쓰는 가격은 이 서버가 앞서 검색하며 남겨 둔 기록이다. 외부 가격
-    API는 호출하지 않는다. 기록이 2건 미만이면 판단을 보류하고 현재 건수를
-    알린다. 기록이 충분하면 현재가, 90일 최저가, 평균, 그리고 한 줄 결론을
-    돌려준다. 현재가가 최저가의 102% 이하면 최저가 수준, 평균 이하면 평균보다
-    싼 편, 평균보다 비싸면 그 비율을 말한다.
+    Prices come only from earlier searches recorded on this server. No external price API is called. With fewer than two records, the tool reports the count and does not guess. Otherwise it returns the current price, the 90-day low, the average, and one line: near the low when the current price is at or below 102 percent of the low, at or below the average, or the percent above the average.
 
-    product_name은 상품명이고 mall은 판매처다. mall을 비우면 판매처가 비어
-    있는 기록만 본다. 상품명에서는 한글, 영문, 숫자만 남기고 앞 30자로 기록을
-    찾는다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를
-    넘기면 판단 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
+    product_name is the product name. mall is the seller. An empty mall matches only records stored with an empty seller. The lookup keeps letters and digits from the name and uses the first 30. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     key = product_key_of(product_name, mall)
     st = price_stats(key)
     if not st or st["count"] < 2:
@@ -415,22 +477,19 @@ def check_price_timing(product_name: str, mall: str = "") -> str:
 )
 @metered
 def get_buy_link(product_url: str, product_name: str = "") -> str:
-    """받은 상품 주소의 구매 링크를 돌려준다. 페이지를 열거나 결제하지 않는다.
+    """Return a product URL {service}. This does not open the page, take payment, or suggest that anyone should buy.
 
-    주소에 coupang.com이 들어 있고 서버에 어필리에이트 ID가 있으면 partner_id
-    쿼리를 붙인다. 그렇지 않으면 받은 주소를 그대로 돌려준다.
+    If the URL contains coupang.com and the server has an affiliate id, a partner_id query parameter is added. Otherwise the URL is returned unchanged.
 
-    product_url은 상품 주소다. product_name은 선택이며 링크 내용에 반영되지
-    않는다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를
-    넘기면 링크 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
+    product_url is the product address. product_name is optional and is not written into the URL. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     url = product_url
-    note = "어필리에이트 미설정 — 원본 링크 반환"
+    note = "No affiliate tag is configured. The original URL is returned unchanged."
     if AFFILIATE_ID and "coupang.com" in url:
         # 쿠팡 파트너스: 실제 운영 시 파트너스 API로 단축링크 생성 권장
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}partner_id={AFFILIATE_ID}"
-        note = f"어필리에이트 태그 적용됨 ({AFFILIATE_ID})"
-    return f"[구매 링크]\n{url}\n({note})"
+        note = "An affiliate tag was added to the URL."
+    return f"Product link\n{url}\n{note}"
 
 
 # ---------- 펫 버티컬 확장 ----------
@@ -508,22 +567,11 @@ def _find_pet_product(query: str):
 def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
                   grain_free_only: bool = False, max_price: int = 0,
                   sort_by: str = "protein") -> str:
-    """catalog.json의 펫푸드를 조건으로 걸러 돌려준다. 외부 API는 호출하지 않는다.
+    """Filter pet food in catalog.json and return the matches {service}. No external API is called.
 
-    가격과 영양 수치는 카탈로그에 있는 값만 쓰고, 없으면 미확인으로 표시한다.
-    조건에 맞는 상품이 없으면 그렇게 알린다.
+    Only catalog prices and nutrition values are used. Missing numbers are shown as unknown. If nothing matches, the result says so.
 
-    pet은 강아지 또는 고양이다. age는 퍼피, 키튼, 성견, 성묘, 시니어, 어덜트,
-    전연령 중 하나이며 비우면 연령으로 거르지 않는다. 어덜트는 성견과 성묘를
-    함께 가리킨다. age에 전연령을 주면 연령과 상관없이 모두 남고, 상품 연령이
-    전연령이면 어떤 연령 필터에도 남는다.
-    exclude_allergen에 준 문자열이 상품의 알레르기 원료 목록에 있으면 그
-    상품을 빼며, 비우면 제외하지 않는다. grain_free_only가 참이면 그레인프리만
-    남긴다. max_price가 0이면 가격 제한이 없고, 다른 값이면 그 금액 이하만
-    남긴다. sort_by는 protein(단백질이 높은 순, 기본값), price(가격이 낮은 순),
-    rating(평점이 높은 순)이다. 그 밖의 값은 protein과 같이 단백질이 높은 순이다.
-    호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를 넘기면
-    목록 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
+    pet is 강아지 (dog) or 고양이 (cat). age is 퍼피, 키튼, 성견, 성묘, 시니어, 어덜트, or 전연령; empty skips the age filter. 어덜트 matches 성견 and 성묘. age 전연령 keeps every age, and a product aged 전연령 passes any age filter. exclude_allergen drops a product when that string is in its allergen list; empty drops nothing. grain_free_only, when true, keeps grain-free products. max_price of 0 means no cap; any other value keeps products at or below that price. sort_by is protein (highest protein, default), price (lowest price), or rating (highest rating). Any other sort_by sorts like protein. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     pet = pet.strip()
     results = [p for p in pet_catalog() if p.get("pet") == pet]
     results = [p for p in results if _age_ok(p.get("age") or "", age)]
@@ -567,16 +615,11 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
 )
 @metered
 def compare_nutrition(product_a: str, product_b: str) -> str:
-    """catalog.json에 있는 두 펫푸드의 가격, 단백질, 지방, 칼로리, 그레인프리 여부, 평점을 나란히 비교한다.
+    """Compare two pet foods in catalog.json side by side {service}: price, protein, fat, calories, grain-free, and rating.
 
-    카탈로그에 없는 수치는 만들지 않고 미확인으로 둔다. 외부 API는 호출하지
-    않는다.
+    Values missing from the catalog are shown as unknown and are not invented. No external API is called.
 
-    product_a와 product_b는 상품명 일부 또는 상품 id다. 공백을 없애고
-    대소문자를 가리지 않은 뒤, 상품명에 포함되거나 id가 같으면 찾는다. 여러
-    개면 이름이 더 짧은 상품을 고른다. 둘 중 하나라도 없으면 찾지 못했다고
-    알린다. 호출에는 이 서버의 API 키가 필요하다. 그 키가 없거나, 등록되지 않았거나, 이번 달 한도를
-    넘기면 비교 대신 오류 JSON을 돌려주며, 그 호출은 집계되지 않는다."""
+    product_a and product_b are part of a product name or a product id. Spaces are ignored and letter case does not matter. A name matches when it contains the query, and an id matches when it is equal. If several match, the shorter name is used. If either product is missing, the result says it was not found. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     a, b = _find_pet_product(product_a), _find_pet_product(product_b)
     source = static_source_label()
     if not a or not b:
@@ -627,13 +670,11 @@ def compare_nutrition(product_a: str, product_b: str) -> str:
 )
 @metered(consume=False)
 def get_usage() -> str:
-    """이 요청의 API 키에 대한 이번 달 사용량만 JSON으로 돌려준다.
+    """Return this request's API-key usage for the current UTC month as JSON {service}.
 
-    호출 수, 남은 횟수, 월간 한도, UTC 달력 월, 다음 초기화 시각(UTC), 집계되는
-    도구 목록이 들어 있다. 키 원문은 없고 짧은 key_id만 있으며, 다른 키의
-    사용량은 들어 있지 않다.
-    이 조회는 호출 수에 포함되지 않는다. 인자는 없다. 호출 키가 없거나
-    등록되지 않으면 오류 JSON을 돌려준다. 한도를 넘긴 상태에서도 조회는 된다."""
+    The object includes calls used, calls remaining, the monthly quota, the month, the next reset time in UTC, and the metered tool names. It includes a short key_id, not the raw key, and not any other key's usage.
+
+    This call takes no arguments and does not count against the quota. A missing, invalid, or expired key is rejected. A key that is already over its quota can still be read."""
     view = _caller_view.get()
     if view is None:
         raise RuntimeError("사용량 컨텍스트가 없습니다.")
@@ -654,8 +695,149 @@ async def usage_route(request: Request) -> Response:
         view = metering.get_meter().inspect(key)
     except metering.MeterError as err:
         status = 503 if err.code == "server_unconfigured" else 401
-        return _json_response(err.payload, status_code=status)
+        extra = {"WWW-Authenticate": _auth_challenge(err.code)} if status == 401 else None
+        return _json_response(err.payload, status_code=status, extra_headers=extra)
     return _json_response(view.to_dict())
+
+
+def _auth_challenge(code: str) -> str:
+    """RFC 6750 challenge. The JSON body keeps the existing error code."""
+    if code == "missing_api_key":
+        error, description = "invalid_request", "API key required"
+    elif code == "expired_api_key":
+        error, description = "invalid_token", "API key expired"
+    else:
+        error, description = "invalid_token", "API key is invalid"
+    return (
+        f'Bearer realm="agent-shopping", error="{error}", '
+        f'error_description="{description}"'
+    )
+
+
+def _scope_headers(scope) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in scope.get("headers") or ():
+        headers[key.decode("latin-1")] = value.decode("latin-1")
+    return headers
+
+
+def _scope_query(scope) -> dict[str, str]:
+    parsed = urllib.parse.parse_qs((scope.get("query_string") or b"").decode("latin-1"), keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items() if values}
+
+
+def _tools_call_names(body: bytes) -> list[str]:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    messages = payload if isinstance(payload, list) else [payload]
+    names: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("method") != "tools/call":
+            continue
+        params = message.get("params")
+        if not isinstance(params, dict):
+            continue
+        name = params.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _key_required_tool(names: list[str]) -> str | None:
+    for name in names:
+        tool = mcp._tool_manager.get_tool(name)
+        if tool is not None and getattr(tool.fn, "_requires_api_key", False):
+            return name
+    return None
+
+
+def _unauthorized(err: metering.MeterError, tool_name: str) -> Response:
+    payload = dict(err.payload)
+    payload["tool"] = tool_name
+    return _json_response(
+        payload,
+        status_code=401,
+        extra_headers={"WWW-Authenticate": _auth_challenge(err.code)},
+    )
+
+
+async def _buffer_http_body(receive):
+    messages = []
+    chunks = []
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message["type"] != "http.request":
+            break
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body", False):
+            break
+    return b"".join(chunks), messages
+
+
+def _replay(messages, receive):
+    pending = list(messages)
+
+    async def replay():
+        if pending:
+            return pending.pop(0)
+        return await receive()
+
+    return replay
+
+
+async def _http_disconnect():
+    return {"type": "http.disconnect"}
+
+
+class ToolCallAuthMiddleware:
+    """Reject key-gated tools/call with HTTP 401 before the MCP handler runs.
+
+    initialize, tools/list, and every other method stay open. The key is read
+    the same way as the tools: Authorization Bearer, then X-API-Key, then
+    ?api_key=. Quota is not an auth failure and is still decided inside the tool.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        path = (scope.get("path") or "").rstrip("/") or "/"
+        if path != "/mcp":
+            await self.app(scope, receive, send)
+            return
+
+        body, messages = await _buffer_http_body(receive)
+        tool_name = _key_required_tool(_tools_call_names(body))
+        if tool_name is not None:
+            failure = metering.get_meter().auth_failure(
+                metering.extract_api_key(
+                    headers=_scope_headers(scope),
+                    query_params=_scope_query(scope),
+                )
+            )
+            if failure is not None:
+                await _unauthorized(failure, tool_name)(scope, _http_disconnect, send)
+                return
+
+        await self.app(scope, _replay(messages, receive), send)
+
+
+_build_streamable_http_app = mcp.streamable_http_app
+
+
+def streamable_http_app():
+    app = _build_streamable_http_app()
+    app.add_middleware(ToolCallAuthMiddleware)
+    return app
+
+
+mcp.streamable_http_app = streamable_http_app
 
 
 if __name__ == "__main__":

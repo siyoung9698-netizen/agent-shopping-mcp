@@ -130,6 +130,22 @@ class MeterConfigTests(unittest.TestCase):
                 con.close()
             self.assertEqual(stored, metering.key_fingerprint("dev-demo-key"))
 
+    def test_expired_key_is_rejected_and_a_future_expiry_is_not(self):
+        clock = {"now": datetime(2026, 11, 1, tzinfo=timezone.utc)}
+        with tempfile.TemporaryDirectory() as tmp:
+            meter = metering.UsageMeter(
+                os.path.join(tmp, "usage.db"),
+                {"old-key": 5, "live-key": 5},
+                clock=lambda: clock["now"],
+                expires_at={"old-key": datetime(2026, 10, 1, tzinfo=timezone.utc)},
+            )
+            with self.assertRaises(metering.MeterError) as caught:
+                meter.consume("old-key")
+            self.assertEqual(caught.exception.code, "expired_api_key")
+            self.assertIsNotNone(meter.auth_failure("old-key"))
+            self.assertIsNone(meter.auth_failure("live-key"))
+            self.assertEqual(meter.consume("live-key").calls_used, 1)
+
 
 class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -217,6 +233,12 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(description, name)
             self.assertEqual(tool.description, description, name)
             self.assertNotRegex(description, r"\n[ \t]+\S", name)
+            phrase = f"from {server.SERVICE_NAME_EN}({server.SERVICE_NAME_KO})"
+            self.assertEqual(phrase, "from BuyWhen(뭐살까? 언제살까?)")
+            self.assertIn(phrase, description, name)
+            self.assertNotIn("{service}", description, name)
+            self.assertLessEqual(len(description), 1024, name)
+            self.assertTrue(getattr(server, name)._requires_api_key, name)
 
     async def test_valid_key_increments_and_get_usage_matches(self):
         async with self._session() as client:
@@ -375,21 +397,38 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
                 headers={"Authorization": "Bearer dev-demo-key"},
                 timeout=httpx.Timeout(10, read=10),
             ) as http_client:
-                async with streamable_http_client(url, http_client=http_client) as (read, write, _sid):
+                async with streamable_http_client(url, http_client=http_client) as (read, write, get_session_id):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
+                        self.assertIsNone(get_session_id())
                         result = await session.call_tool("search_products", {"keyword": "비타민"})
                         self.assertFalse(result.isError, result)
+                        self.assertIsNone(get_session_id())
                         usage = json.loads((await session.call_tool("get_usage", {})).content[0].text)
                         self.assertEqual(usage["calls_used"], 1)
                         self.assertEqual(usage["calls_remaining"], 9)
 
             async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=10)) as http_client:
-                async with streamable_http_client(url, http_client=http_client) as (read, write, _sid):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        denied = await session.call_tool("search_products", {"keyword": "비타민"})
-                        self.assertEqual(_error_payload(denied)["error"], "missing_api_key")
+                denied = await http_client.post(
+                    url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "search_products",
+                            "arguments": {"keyword": "비타민"},
+                        },
+                    },
+                    headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                    },
+                )
+                self.assertEqual(denied.status_code, 401)
+                self.assertEqual(denied.json()["error"], "missing_api_key")
+                self.assertIn("Bearer", denied.headers["www-authenticate"])
+                self.assertNotIn("mcp-session-id", {key.lower() for key in denied.headers})
 
             async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=10)) as http_client:
                 async with streamable_http_client(
@@ -414,6 +453,57 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
         async with self._session() as client:
             result = await client.call_tool("search_products", {"keyword": "비타민"})
         self.assertEqual(_error_payload(result)["error"], "server_unconfigured")
+
+    async def test_expired_key_is_a_tool_error_and_does_not_count(self):
+        metering.reset_meter(
+            self.db_path,
+            {"dev-demo-key": 100, "partner-key": 100},
+            expires_at={"dev-demo-key": datetime(2020, 1, 1, tzinfo=timezone.utc)},
+        )
+        async with self._session() as client:
+            os.environ["MCP_API_KEY"] = "dev-demo-key"
+            expired = await client.call_tool("search_products", {"keyword": "비타민"})
+            self.assertEqual(_error_payload(expired)["error"], "expired_api_key")
+            os.environ["MCP_API_KEY"] = "partner-key"
+            usage = json.loads((await client.call_tool("get_usage", {})).content[0].text)
+        self.assertEqual(usage["calls_used"], 0)
+        self.assertEqual(_price_rows(), 0)
+
+    async def test_tool_text_is_capped_at_24000_characters(self):
+        async with self._session() as client:
+            result = await client.call_tool("search_products", {"keyword": "가" * 30000})
+        self.assertFalse(result.isError, result)
+        text = result.content[0].text
+        self.assertLessEqual(len(text), server.MAX_TOOL_RESPONSE_CHARS)
+        self.assertIn("[truncated]", text)
+        self.assertLessEqual(len(result.structuredContent["result"]), server.MAX_TOOL_RESPONSE_CHARS)
+
+    async def test_buy_link_response_does_not_push_a_purchase(self):
+        previous = server.AFFILIATE_ID
+        try:
+            server.AFFILIATE_ID = ""
+            async with self._session() as client:
+                plain = await client.call_tool(
+                    "get_buy_link",
+                    {"product_url": "https://example.com/item"},
+                )
+                self.assertFalse(plain.isError, plain)
+                text = plain.content[0].text
+                self.assertIn("https://example.com/item", text)
+                self.assertIn("original URL is returned unchanged", text)
+                self.assertNotRegex(text, r"구매|buy now|구매하세요|지금 사")
+
+                server.AFFILIATE_ID = "partner"
+                tagged = await client.call_tool(
+                    "get_buy_link",
+                    {"product_url": "https://www.coupang.com/vp/products/1"},
+                )
+            tagged_text = tagged.content[0].text
+            self.assertIn("partner_id=partner", tagged_text)
+            self.assertIn("An affiliate tag was added to the URL.", tagged_text)
+            self.assertNotRegex(tagged_text, r"구매|buy now|구매하세요|지금 사")
+        finally:
+            server.AFFILIATE_ID = previous
 
 
 class HttpRouteTests(unittest.TestCase):
@@ -451,6 +541,7 @@ class HttpRouteTests(unittest.TestCase):
             missing = client.get("/usage")
             self.assertEqual(missing.status_code, 401)
             self.assertEqual(missing.json()["error"], "missing_api_key")
+            self.assertIn("Bearer", missing.headers["www-authenticate"])
 
             demo = client.get("/usage", headers={"Authorization": "Bearer dev-demo-key"})
             self.assertEqual(demo.status_code, 200)
@@ -492,6 +583,202 @@ class HttpRouteTests(unittest.TestCase):
             usage = client.get("/usage", headers={"X-API-Key": "dev-demo-key"})
         self.assertEqual(usage.status_code, 503)
         self.assertEqual(usage.json()["error"], "server_unconfigured")
+
+
+def _rpc(client, method, params=None, headers=None, query=""):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method}
+    if params is not None:
+        payload["params"] = params
+    hdrs = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if headers:
+        hdrs.update(headers)
+    return client.post("/mcp" + query, json=payload, headers=hdrs)
+
+
+def _tool_call(name, arguments):
+    return {"name": name, "arguments": arguments}
+
+
+class HttpToolAuthTests(unittest.TestCase):
+    """tools/call auth failures are HTTP 401. initialize and tools/list stay open."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "usage.db")
+        self.previous = {
+            "MCP_API_KEYS": os.environ.get("MCP_API_KEYS"),
+            "MCP_MONTHLY_QUOTA": os.environ.get("MCP_MONTHLY_QUOTA"),
+            "MCP_KEY_QUOTAS": os.environ.get("MCP_KEY_QUOTAS"),
+            "MCP_USAGE_DB_PATH": os.environ.get("MCP_USAGE_DB_PATH"),
+            "MCP_API_KEY": os.environ.get("MCP_API_KEY"),
+        }
+        os.environ["MCP_API_KEYS"] = "dev-demo-key,partner-key"
+        os.environ["MCP_MONTHLY_QUOTA"] = "100"
+        os.environ.pop("MCP_KEY_QUOTAS", None)
+        os.environ["MCP_USAGE_DB_PATH"] = self.db_path
+        os.environ.pop("MCP_API_KEY", None)
+        self.prices = server.DB_PATH
+        self.naver = (server.NAVER_ID, server.NAVER_SECRET)
+        self.affiliate = server.AFFILIATE_ID
+        server.DB_PATH = os.path.join(self.tmp.name, "prices.db")
+        server.NAVER_ID = ""
+        server.NAVER_SECRET = ""
+        server.AFFILIATE_ID = ""
+        metering.reset_meter()
+        server.mcp._session_manager = None
+        self.app = server.mcp.streamable_http_app()
+        self.assertTrue(server.mcp.settings.stateless_http)
+
+    def tearDown(self):
+        server.DB_PATH = self.prices
+        server.NAVER_ID, server.NAVER_SECRET = self.naver
+        server.AFFILIATE_ID = self.affiliate
+        for name, value in self.previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.tmp.cleanup()
+
+    def _client(self):
+        from starlette.testclient import TestClient
+
+        # Host must match the default DNS-rebinding allow-list (127.0.0.1:*).
+        return TestClient(self.app, base_url="http://127.0.0.1:8765")
+
+    def test_initialize_and_tools_list_work_without_a_key_or_session(self):
+        with self._client() as client:
+            opened = _rpc(
+                client,
+                "initialize",
+                {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "smoke", "version": "0"},
+                },
+            )
+            self.assertEqual(opened.status_code, 200, opened.text)
+            self.assertNotIn("mcp-session-id", {key.lower() for key in opened.headers})
+            listed = _rpc(client, "tools/list", {})
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertIn("search_products", listed.text)
+            self.assertIn("from BuyWhen(뭐살까? 언제살까?)", listed.text)
+            self.assertNotIn("mcp-session-id", {key.lower() for key in listed.headers})
+
+    def test_tools_call_without_a_key_is_401_and_does_not_run(self):
+        with self._client() as client:
+            denied = _rpc(
+                client,
+                "tools/call",
+                _tool_call("search_products", {"keyword": "비타민"}),
+            )
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.json()["error"], "missing_api_key")
+        self.assertEqual(denied.json()["tool"], "search_products")
+        challenge = denied.headers["www-authenticate"]
+        self.assertIn('Bearer', challenge)
+        self.assertIn('error="invalid_request"', challenge)
+        self.assertEqual(metering.get_meter().inspect("dev-demo-key").calls_used, 0)
+        self.assertEqual(_price_rows(), 0)
+
+    def test_invalid_and_expired_keys_are_401(self):
+        with self._client() as client:
+            invalid = _rpc(
+                client,
+                "tools/call",
+                _tool_call("get_usage", {}),
+                headers={"Authorization": "Bearer nope"},
+            )
+            self.assertEqual(invalid.status_code, 401)
+            self.assertEqual(invalid.json()["error"], "invalid_api_key")
+            self.assertIn('error="invalid_token"', invalid.headers["www-authenticate"])
+
+            metering.reset_meter(
+                self.db_path,
+                {"dev-demo-key": 100, "partner-key": 100},
+                expires_at={"dev-demo-key": datetime(2020, 1, 1, tzinfo=timezone.utc)},
+            )
+            expired = _rpc(
+                client,
+                "tools/call",
+                _tool_call("find_pet_food", {"pet": "강아지"}),
+                headers={"X-API-Key": "dev-demo-key"},
+            )
+            self.assertEqual(expired.status_code, 401)
+            self.assertEqual(expired.json()["error"], "expired_api_key")
+            self.assertIn("API key expired", expired.headers["www-authenticate"])
+            usage = client.get("/usage", headers={"X-API-Key": "dev-demo-key"})
+            self.assertEqual(usage.status_code, 401)
+            self.assertEqual(usage.json()["error"], "expired_api_key")
+
+        with sqlite3.connect(self.db_path) as con:
+            used = con.execute("select count(*) from usage_counters").fetchone()[0]
+        self.assertEqual(used, 0)
+        self.assertEqual(_price_rows(), 0)
+
+    def test_valid_key_calls_succeed_for_bearer_header_and_query(self):
+        with self._client() as client:
+            bearer = _rpc(
+                client,
+                "tools/call",
+                _tool_call("search_products", {"keyword": "비타민"}),
+                headers={"Authorization": "Bearer dev-demo-key"},
+            )
+            self.assertEqual(bearer.status_code, 200, bearer.text)
+            self.assertIn("static_catalog", bearer.text)
+            self.assertNotIn("mcp-session-id", {key.lower() for key in bearer.headers})
+
+            header = _rpc(
+                client,
+                "tools/call",
+                _tool_call("check_price_timing", {"product_name": "없음"}),
+                headers={"X-API-Key": "partner-key"},
+            )
+            self.assertEqual(header.status_code, 200, header.text)
+
+            queried = _rpc(
+                client,
+                "tools/call",
+                _tool_call("get_buy_link", {"product_url": "https://example.com/item"}),
+                query="?api_key=dev-demo-key",
+            )
+            self.assertEqual(queried.status_code, 200, queried.text)
+            self.assertIn("Product link", queried.text)
+            self.assertNotIn("구매", queried.text)
+
+        self.assertEqual(metering.get_meter().inspect("dev-demo-key").calls_used, 2)
+        self.assertEqual(metering.get_meter().inspect("partner-key").calls_used, 1)
+
+    def test_quota_exceeded_stays_a_tool_error_and_unconfigured_is_not_401(self):
+        metering.reset_meter(self.db_path, {"dev-demo-key": 0, "partner-key": 100})
+        with self._client() as client:
+            denied = _rpc(
+                client,
+                "tools/call",
+                _tool_call("search_products", {"keyword": "비타민"}),
+                headers={"Authorization": "Bearer dev-demo-key"},
+            )
+            self.assertEqual(denied.status_code, 200, denied.text)
+            self.assertIn("quota_exceeded", denied.text)
+            self.assertEqual(_price_rows(), 0)
+
+        os.environ["MCP_API_KEYS"] = ""
+        metering.reset_meter()
+        server.mcp._session_manager = None
+        app = server.mcp.streamable_http_app()
+        from starlette.testclient import TestClient
+
+        with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+            unconfigured = _rpc(
+                client,
+                "tools/call",
+                _tool_call("search_products", {"keyword": "비타민"}),
+            )
+        self.assertNotEqual(unconfigured.status_code, 401)
+        self.assertIn("server_unconfigured", unconfigured.text)
 
 
 if __name__ == "__main__":
