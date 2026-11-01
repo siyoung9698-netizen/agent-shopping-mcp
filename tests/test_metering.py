@@ -168,14 +168,20 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
 
             calls = [
                 ("search_products", {"keyword": "비타민"}),
-                ("check_price_timing", {"product_name": "종근당건강 락토핏 골드"}),
+                ("check_price_timing", {"product_name": "고려은단 비타민C 1000"}),
                 ("get_buy_link", {"product_url": "https://www.coupang.com/"}),
                 ("find_pet_food", {"pet": "강아지"}),
-                ("compare_nutrition", {"product_a": "오리젠", "product_b": "로얄캐닌"}),
+                ("compare_nutrition", {"product_a": "로얄캐닌", "product_b": "힐스"}),
             ]
+            texts = {}
             for name, args in calls:
                 result = await client.call_tool(name, args)
                 self.assertFalse(result.isError, result)
+                texts[name] = result.content[0].text
+            self.assertIn("static_catalog", texts["search_products"])
+            self.assertIn("static_catalog", texts["find_pet_food"])
+            self.assertIn("영양성분 비교", texts["compare_nutrition"])
+            self.assertNotIn("못 찾았어", texts["compare_nutrition"])
 
             usage = await client.call_tool("get_usage", {})
             self.assertFalse(usage.isError, usage)
