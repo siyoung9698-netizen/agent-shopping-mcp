@@ -1,24 +1,37 @@
 """에이전트용 최저가+타이밍 쇼핑 MCP 서버 (MVP)
 
 에이전트가 호출하는 도구:
-  - search_products  : 상품 검색 (네이버 키가 있으면 쇼핑 API, 없으면 catalog.json)
-  - check_price_timing: 지금 사기 좋은 타이밍인지 판단 (가격 히스토리 기반)
-  - get_buy_link     : 어필리에이트 태그가 붙은 구매 링크 반환
-  - find_pet_food    : 펫 사료 조건 검색 (catalog.json의 pet_food)
-  - compare_nutrition: 두 사료 영양성분 비교 (같은 카탈로그)
+  - search_products  : 상품 검색 (네이버 키가 있으면 쇼핑 API, 없으면 catalog.json) — 과금 호출
+  - check_price_timing: 지금 사기 좋은 타이밍인지 판단 (가격 히스토리 기반) — 과금 호출
+  - get_buy_link     : 어필리에이트 태그가 붙은 구매 링크 반환 — 과금 호출
+  - find_pet_food    : 펫 사료 조건 검색 (catalog.json의 pet_food) — 과금 호출
+  - compare_nutrition: 두 사료 영양성분 비교 (같은 카탈로그) — 과금 호출
+  - get_usage        : 이 API 키의 이번 달 사용량 (과금하지 않음)
 
+도구 호출에는 API 키가 필요하다. 키·한도·저장소는 metering.py 참고.
 실행: .venv/bin/python server.py  (stdio 모드, MCP 클라이언트용)
 """
 
+import functools
+import inspect
 import json
 import os
 import re
 import sqlite3
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from datetime import datetime
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from starlette.requests import Request
+from starlette.responses import Response
+
+import metering
+
+# .env는 이미 설정된 환경변수(Render 등)를 덮어쓰지 않는다.
+metering.load_local_env()
 
 mcp = FastMCP("agent-shopping")
 
@@ -92,6 +105,108 @@ def _static_hits(keyword: str) -> list:
 def pet_catalog() -> list:
     """펫 도구가 보는 유일한 목록. search_products와 같은 catalog.json."""
     return [p for p in STATIC_PRODUCTS if p.get("category") == "pet_food"]
+
+# get_usage가 방금 조회한 스냅샷을 읽는다. 도구 인자로 키를 받지 않기 위함.
+_caller_view: ContextVar[metering.UsageView | None] = ContextVar("caller_view", default=None)
+
+
+def resolve_caller_key(ctx: Context | None) -> str | None:
+    """HTTP 요청이면 헤더/쿼리만 보고, stdio처럼 요청이 없으면 MCP_API_KEY를 본다.
+
+    HTTP에서 프로세스 환경변수로 폴백하지 않는다. Render에 MCP_API_KEY가
+    남아 있어도 키 없는 외부 호출이 그 키로 집계되면 안 된다.
+    """
+    request = _http_request(ctx)
+    if request is not None:
+        return metering.extract_api_key(
+            headers=request.headers,
+            query_params=getattr(request, "query_params", None),
+        )
+    return os.environ.get("MCP_API_KEY", "").strip() or None
+
+
+def _http_request(ctx: Context | None):
+    if ctx is None:
+        return None
+    request_context = getattr(ctx, "_request_context", None)
+    if request_context is None:
+        return None
+    request = getattr(request_context, "request", None)
+    if request is None or not hasattr(request, "headers"):
+        return None
+    return request
+
+
+def _tool_error(err: metering.MeterError, tool_name: str) -> CallToolResult:
+    payload = dict(err.payload)
+    payload["tool"] = tool_name
+    text = json.dumps(payload, ensure_ascii=False)
+    # 성공 응답과 같은 output schema({result: string})를 만족시키면서 isError로 실패시킨다.
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={"result": text},
+        isError=True,
+    )
+
+
+def _json_response(payload: dict, status_code: int = 200) -> Response:
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False),
+        status_code=status_code,
+        media_type="application/json; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
+def metered(fn=None, *, consume: bool = True):
+    """도구 호출 앞에서 키를 확인하고, consume=True면 월간 카운터를 1 올린다."""
+
+    def decorate(func):
+        def gate(kwargs):
+            ctx = kwargs.pop("ctx", None)
+            key = resolve_caller_key(ctx)
+            try:
+                meter = metering.get_meter()
+                if consume:
+                    return meter.consume(key)
+                return meter.inspect(key)
+            except metering.MeterError as err:
+                return _tool_error(err, func.__name__)
+
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def wrapper(*args, **kwargs):
+                gated = gate(kwargs)
+                if isinstance(gated, CallToolResult):
+                    return gated
+                token = _caller_view.set(gated)
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    _caller_view.reset(token)
+
+        else:
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                gated = gate(kwargs)
+                if isinstance(gated, CallToolResult):
+                    return gated
+                token = _caller_view.set(gated)
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    _caller_view.reset(token)
+
+        annotations = dict(getattr(func, "__annotations__", {}))
+        annotations["ctx"] = Context
+        wrapper.__annotations__ = annotations
+        return wrapper
+
+    if fn is None:
+        return decorate
+    return decorate(fn)
 
 
 # ---------- 가격 히스토리 DB ----------
@@ -178,6 +293,7 @@ def naver_search(keyword: str, limit: int):
 
 
 @mcp.tool()
+@metered
 def search_products(keyword: str, limit: int = 10) -> str:
     """상품을 검색하고 최저가 순으로 반환. 호출될 때마다 가격을 히스토리에 기록한다.
 
@@ -213,6 +329,7 @@ def search_products(keyword: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
+@metered
 def check_price_timing(product_name: str, mall: str = "") -> str:
     """지금 사기 좋은 타이밍인지 판단. 최근 90일 히스토리와 비교한다."""
     key = product_key_of(product_name, mall)
@@ -238,6 +355,7 @@ def check_price_timing(product_name: str, mall: str = "") -> str:
 
 
 @mcp.tool()
+@metered
 def get_buy_link(product_url: str, product_name: str = "") -> str:
     """구매 링크 반환. AFFILIATE_ID가 설정되어 있으면 어필리에이트 태그를 붙인다."""
     url = product_url
@@ -313,6 +431,7 @@ def _find_pet_product(query: str):
 
 
 @mcp.tool()
+@metered
 def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
                   grain_free_only: bool = False, max_price: int = 0,
                   sort_by: str = "protein") -> str:
@@ -353,6 +472,7 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
 
 
 @mcp.tool()
+@metered
 def compare_nutrition(product_a: str, product_b: str) -> str:
     """두 사료의 영양성분을 나란히 비교. 수치는 catalog.json에 있는 값만 쓴다."""
     a, b = _find_pet_product(product_a), _find_pet_product(product_b)
@@ -394,7 +514,43 @@ def compare_nutrition(product_a: str, product_b: str) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool(annotations=ToolAnnotations(title="사용량 조회", readOnlyHint=True))
+@metered(consume=False)
+def get_usage() -> str:
+    """이 API 키의 이번 달 호출 수, 남은 한도, 초기화 시각을 반환한다.
+
+    검색·비교·구매 링크 도구와 달리 이 호출은 사용량에 포함되지 않는다.
+    다른 키의 사용량은 반환하지 않는다.
+    """
+    view = _caller_view.get()
+    if view is None:
+        raise RuntimeError("사용량 컨텍스트가 없습니다.")
+    return json.dumps(view.to_dict(), ensure_ascii=False)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_route(_request: Request) -> Response:
+    """프로세스 생존 확인. 테넌트 사용량은 포함하지 않는다."""
+    return _json_response({"status": "ok", "service": "agent-shopping"})
+
+
+@mcp.custom_route("/usage", methods=["GET"])
+async def usage_route(request: Request) -> Response:
+    """이 요청의 API 키에 대한 사용량만 반환한다."""
+    key = metering.extract_api_key(headers=request.headers, query_params=request.query_params)
+    try:
+        view = metering.get_meter().inspect(key)
+    except metering.MeterError as err:
+        status = 503 if err.code == "server_unconfigured" else 401
+        return _json_response(err.payload, status_code=status)
+    return _json_response(view.to_dict())
+
+
 if __name__ == "__main__":
+    try:
+        metering.get_meter()
+    except ValueError as exc:
+        raise SystemExit(f"미터링 설정 오류: {exc}") from exc
     # MCP_TRANSPORT=stdio (기본, 로컬 MCP 클라이언트용)
     # MCP_TRANSPORT=streamable-http (원격 배포용: Render/Railway 등에서 HTTP로 노출)
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
