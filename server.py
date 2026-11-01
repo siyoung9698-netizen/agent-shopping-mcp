@@ -292,7 +292,18 @@ def naver_search(keyword: str, limit: int):
     return items
 
 
-@mcp.tool()
+# 힌트는 호출이 실제로 바꾸는 것에 맞춘다.
+# 과금 도구는 사용량 카운터를 올리고, 상품·사료 검색은 가격 행도 추가한다.
+# 외부 네트워크는 네이버 키가 있을 때의 search_products뿐이다.
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="상품 검색",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
+)
 @metered
 def search_products(keyword: str, limit: int = 10) -> str:
     """상품을 검색하고 최저가 순으로 반환. 호출될 때마다 가격을 히스토리에 기록한다.
@@ -328,7 +339,15 @@ def search_products(keyword: str, limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="가격 타이밍",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 @metered
 def check_price_timing(product_name: str, mall: str = "") -> str:
     """지금 사기 좋은 타이밍인지 판단. 최근 90일 히스토리와 비교한다."""
@@ -354,7 +373,15 @@ def check_price_timing(product_name: str, mall: str = "") -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="구매 링크",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 @metered
 def get_buy_link(product_url: str, product_name: str = "") -> str:
     """구매 링크 반환. AFFILIATE_ID가 설정되어 있으면 어필리에이트 태그를 붙인다."""
@@ -430,7 +457,15 @@ def _find_pet_product(query: str):
     return hits[0]
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="펫사료 검색",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 @metered
 def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
                   grain_free_only: bool = False, max_price: int = 0,
@@ -471,7 +506,15 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="영양성분 비교",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
 @metered
 def compare_nutrition(product_a: str, product_b: str) -> str:
     """두 사료의 영양성분을 나란히 비교. 수치는 catalog.json에 있는 값만 쓴다."""
@@ -514,7 +557,15 @@ def compare_nutrition(product_a: str, product_b: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="사용량 조회", readOnlyHint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="사용량 조회",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 @metered(consume=False)
 def get_usage() -> str:
     """이 API 키의 이번 달 호출 수, 남은 한도, 초기화 시각을 반환한다.
