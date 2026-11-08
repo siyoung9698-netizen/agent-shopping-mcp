@@ -16,6 +16,7 @@
 import functools
 import inspect
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -840,6 +841,120 @@ async def usage_route(request: Request) -> Response:
     return _json_response(view.to_dict())
 
 
+AUTH_DIAGNOSTIC_LOGGER_NAME = "agent_shopping.auth"
+AUTH_REJECTION_EVENT = "mcp_tool_auth_rejected"
+UNKNOWN_AUTH_TOOL = "unknown"
+AUTH_DIAGNOSTIC_TOOLS = (
+    "search_products",
+    "check_price_timing",
+    "get_buy_link",
+    "find_pet_food",
+    "compare_nutrition",
+    "lookup_functional_food_filing",
+    "get_usage",
+)
+AUTH_REJECTION_LOG_FIELDS = (
+    "event",
+    "timestamp",
+    "tool",
+    "error",
+    "auth_source",
+    "authorization_scheme",
+    "x_api_key_present",
+)
+_AUTH_LOG_LINE_RE = re.compile(r"[\x20-\x7e]+")
+_AUTH_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_auth_diagnostic_logger = logging.getLogger(AUTH_DIAGNOSTIC_LOGGER_NAME)
+_auth_diagnostic_logger.setLevel(logging.WARNING)
+
+
+def _allowlisted(value: object, allowed: tuple[str, ...], fallback: str) -> str:
+    if isinstance(value, str):
+        for item in allowed:
+            if value == item:
+                return item
+    return fallback
+
+
+def _allowlisted_auth_error(code: object) -> str | None:
+    if isinstance(code, str):
+        for item in metering.AUTH_FAILURE_CODES:
+            if code == item:
+                return item
+    return None
+
+
+def _utc_auth_timestamp(clock) -> str:
+    now = datetime.now(timezone.utc) if clock is None else clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _auth_rejection_payload(tool_name, error_code, selection, clock) -> dict | None:
+    error = _allowlisted_auth_error(error_code)
+    if error is None:
+        return None
+    payload = {
+        "event": AUTH_REJECTION_EVENT,
+        "timestamp": _utc_auth_timestamp(clock),
+        "tool": _allowlisted(tool_name, AUTH_DIAGNOSTIC_TOOLS, UNKNOWN_AUTH_TOOL),
+        "error": error,
+        "auth_source": _allowlisted(
+            getattr(selection, "auth_source", None),
+            metering.AUTH_SOURCES,
+            metering.AUTH_SOURCE_NONE,
+        ),
+        "authorization_scheme": _allowlisted(
+            getattr(selection, "authorization_scheme", None),
+            metering.AUTHORIZATION_SCHEMES,
+            metering.AUTHORIZATION_SCHEME_NON_BEARER,
+        ),
+        "x_api_key_present": getattr(selection, "x_api_key_present", False) is True,
+    }
+    if list(payload) != list(AUTH_REJECTION_LOG_FIELDS):
+        return None
+    if payload["event"] != AUTH_REJECTION_EVENT:
+        return None
+    if payload["tool"] not in (*AUTH_DIAGNOSTIC_TOOLS, UNKNOWN_AUTH_TOOL):
+        return None
+    if payload["error"] not in metering.AUTH_FAILURE_CODES:
+        return None
+    if payload["auth_source"] not in metering.AUTH_SOURCES:
+        return None
+    if payload["authorization_scheme"] not in metering.AUTHORIZATION_SCHEMES:
+        return None
+    if payload["x_api_key_present"] is not True and payload["x_api_key_present"] is not False:
+        return None
+    if _AUTH_TIMESTAMP_RE.fullmatch(payload["timestamp"]) is None:
+        return None
+    return payload
+
+
+def emit_auth_rejection(tool_name, error_code, selection, *, clock=None) -> None:
+    """Emit one secret-free JSON line for a rejected HTTP tools/call.
+
+    The message fields are event, timestamp (UTC from this server's clock),
+    tool (an allowlisted name, or unknown), error (missing_api_key,
+    invalid_api_key, or expired_api_key), auth_source (bearer, x-api-key,
+    query, or none), authorization_scheme (bearer, non_bearer, or absent),
+    and x_api_key_present. The key, headers, query string, and request body
+    are not accepted and are not written.
+    """
+    try:
+        payload = _auth_rejection_payload(tool_name, error_code, selection, clock)
+        if payload is None:
+            return
+        line = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        if _AUTH_LOG_LINE_RE.fullmatch(line) is None:
+            return
+        _auth_diagnostic_logger.warning(line)
+    except Exception:
+        return
+
+
 def _auth_challenge(code: str) -> str:
     """RFC 6750 challenge. The JSON body keeps the existing error code."""
     if code == "missing_api_key":
@@ -938,6 +1053,8 @@ class ToolCallAuthMiddleware:
     initialize, tools/list, and every other method stay open. The key is read
     the same way as the tools: Authorization Bearer, then X-API-Key, then
     ?api_key=. Quota is not an auth failure and is still decided inside the tool.
+    A rejection also emits one fixed diagnostic line. That line is not part of
+    the auth decision or the response.
     """
 
     def __init__(self, app):
@@ -955,13 +1072,23 @@ class ToolCallAuthMiddleware:
         body, messages = await _buffer_http_body(receive)
         tool_name = _key_required_tool(_tools_call_names(body))
         if tool_name is not None:
+            headers = _scope_headers(scope)
+            query_params = _scope_query(scope)
             failure = metering.get_meter().auth_failure(
-                metering.extract_api_key(
-                    headers=_scope_headers(scope),
-                    query_params=_scope_query(scope),
-                )
+                metering.extract_api_key(headers=headers, query_params=query_params)
             )
             if failure is not None:
+                try:
+                    emit_auth_rejection(
+                        tool_name,
+                        failure.code,
+                        metering.describe_auth_selection(
+                            headers=headers,
+                            query_params=query_params,
+                        ),
+                    )
+                except Exception:
+                    pass
                 await _unauthorized(failure, tool_name)(scope, _http_disconnect, send)
                 return
 

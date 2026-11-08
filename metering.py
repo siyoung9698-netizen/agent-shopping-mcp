@@ -188,20 +188,11 @@ def extract_api_key(
 
     Precedence: Authorization Bearer, then X-API-Key, then the `api_key` query
     parameter. The query form exists for MCP clients that can only set a URL.
+    A non-bearer Authorization, or a bearer token that is empty, is not a key
+    and does not block a later source. A non-empty bearer token stays selected
+    even when that token is invalid or expired.
     """
-    auth = _header(headers, "authorization")
-    if auth:
-        scheme, _, token = auth.strip().partition(" ")
-        if scheme.lower() == "bearer" and token.strip():
-            return token.strip()
-    header_key = _header(headers, "x-api-key")
-    if header_key and header_key.strip():
-        return header_key.strip()
-    if query_params is not None:
-        query_key = query_params.get("api_key")
-        if query_key and str(query_key).strip():
-            return str(query_key).strip()
-    return None
+    return _select_api_key(headers=headers, query_params=query_params)[0]
 
 
 def _header(headers: Mapping[str, str] | None, name: str) -> str | None:
@@ -219,6 +210,86 @@ def _header(headers: Mapping[str, str] | None, name: str) -> str | None:
         if str(key).lower() == lowered and value:
             return str(value)
     return None
+
+
+AUTH_SOURCE_BEARER = "bearer"
+AUTH_SOURCE_X_API_KEY = "x-api-key"
+AUTH_SOURCE_QUERY = "query"
+AUTH_SOURCE_NONE = "none"
+AUTH_SOURCES = (
+    AUTH_SOURCE_BEARER,
+    AUTH_SOURCE_X_API_KEY,
+    AUTH_SOURCE_QUERY,
+    AUTH_SOURCE_NONE,
+)
+
+AUTHORIZATION_SCHEME_BEARER = "bearer"
+AUTHORIZATION_SCHEME_NON_BEARER = "non_bearer"
+AUTHORIZATION_SCHEME_ABSENT = "absent"
+AUTHORIZATION_SCHEMES = (
+    AUTHORIZATION_SCHEME_BEARER,
+    AUTHORIZATION_SCHEME_NON_BEARER,
+    AUTHORIZATION_SCHEME_ABSENT,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AuthSelection:
+    """Which credential slot was selected. Never holds the key or header text."""
+
+    auth_source: str
+    authorization_scheme: str
+    x_api_key_present: bool
+
+
+def _select_api_key(
+    *,
+    headers: Mapping[str, str] | None,
+    query_params: Mapping[str, str] | None,
+) -> tuple[str | None, str]:
+    """Return the same key extract_api_key has always returned, plus a source enum."""
+    auth = _header(headers, "authorization")
+    if auth:
+        scheme, _, token = auth.strip().partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            return token.strip(), AUTH_SOURCE_BEARER
+    header_key = _header(headers, "x-api-key")
+    if header_key and header_key.strip():
+        return header_key.strip(), AUTH_SOURCE_X_API_KEY
+    if query_params is not None:
+        query_key = query_params.get("api_key")
+        if query_key and str(query_key).strip():
+            return str(query_key).strip(), AUTH_SOURCE_QUERY
+    return None, AUTH_SOURCE_NONE
+
+
+def describe_auth_selection(
+    *,
+    headers: Mapping[str, str] | None,
+    query_params: Mapping[str, str] | None,
+) -> AuthSelection:
+    """Classify the selection extract_api_key would make, without returning the key."""
+    source = _select_api_key(headers=headers, query_params=query_params)[1]
+    return AuthSelection(
+        auth_source=source,
+        authorization_scheme=_authorization_scheme(headers),
+        x_api_key_present=_x_api_key_present(headers),
+    )
+
+
+def _authorization_scheme(headers: Mapping[str, str] | None) -> str:
+    auth = _header(headers, "authorization")
+    if not auth or not str(auth).strip():
+        return AUTHORIZATION_SCHEME_ABSENT
+    scheme = str(auth).strip().partition(" ")[0]
+    if scheme.lower() == "bearer":
+        return AUTHORIZATION_SCHEME_BEARER
+    return AUTHORIZATION_SCHEME_NON_BEARER
+
+
+def _x_api_key_present(headers: Mapping[str, str] | None) -> bool:
+    header_key = _header(headers, "x-api-key")
+    return bool(header_key and str(header_key).strip())
 
 
 class UsageMeter:
