@@ -2,10 +2,11 @@
 
 에이전트가 호출하는 도구:
   - search_products  : 상품 검색 (네이버 키가 있으면 쇼핑 API, 없으면 catalog.json) — 과금 호출
-  - check_price_timing: 지금 사기 좋은 타이밍인지 판단 (가격 히스토리 기반) — 과금 호출
-  - get_buy_link     : 어필리에이트 태그가 붙은 구매 링크 반환 — 과금 호출
+  - check_price_timing: 기록된 가격이 최근 범위에서 낮은지 판단 — 과금 호출
+  - get_buy_link     : 카탈로그에 있는 판매 상품 URL만 반환 — 과금 호출
   - find_pet_food    : 펫 사료 조건 검색 (catalog.json의 pet_food) — 과금 호출
   - compare_nutrition: 두 사료 영양성분 비교 (같은 카탈로그) — 과금 호출
+  - lookup_functional_food_filing: 품목제조번호로 건강기능식품 신고 조회 — 과금 호출
   - get_usage        : 이 API 키의 이번 달 사용량 (과금하지 않음)
 
 도구 호출에는 API 키가 필요하다. 키·한도·저장소는 metering.py 참고.
@@ -21,8 +22,10 @@ import sqlite3
 import urllib.parse
 import urllib.request
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import datetime, timezone
 
+import functional_food
+import product_links
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from starlette.requests import Request
@@ -294,13 +297,29 @@ def _db():
     return con
 
 
-def log_price(product_key: str, name: str, price: int, mall: str):
+def catalog_observed_ts(product: dict) -> str:
+    """Timestamp of the catalog price date. Reading the file again is not a new observation."""
+    checked = product.get("checked_at") or ""
+    if not _DATE_RE.match(checked):
+        checked = STATIC_CHECKED_AT or ""
+    if _DATE_RE.match(checked):
+        return f"{checked}T00:00:00"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def log_price(product_key: str, name: str, price: int, mall: str, observed_ts: str | None = None):
+    ts = observed_ts or datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     con = _db()
-    con.execute(
-        "INSERT INTO price_history VALUES (?,?,?,?,?)",
-        (product_key, name, price, mall, datetime.now().isoformat(timespec="seconds")),
-    )
-    con.commit()
+    existing = con.execute(
+        "SELECT 1 FROM price_history WHERE product_key=? AND price=? AND ts=? LIMIT 1",
+        (product_key, price, ts),
+    ).fetchone()
+    if existing is None:
+        con.execute(
+            "INSERT INTO price_history VALUES (?,?,?,?,?)",
+            (product_key, name, price, mall, ts),
+        )
+        con.commit()
     con.close()
 
 
@@ -321,6 +340,7 @@ def price_stats(product_key: str):
         "min": min(prices),
         "avg": round(sum(prices) / len(prices)),
         "latest": prices[-1],
+        "latest_ts": rows[-1][1][:10],
         "first_seen": rows[0][1][:10],
     }
 
@@ -339,7 +359,7 @@ def _hit_suffix(product: dict) -> str:
     if isinstance(product.get("reviews"), int):
         bits.append(f"리뷰 {product['reviews']:,}개")
     if _DATE_RE.match(product.get("checked_at") or ""):
-        bits.append(f"확인 {product['checked_at']}")
+        bits.append(f"기준일 {product['checked_at']}")
     return (" " + " ".join(bits)) if bits else ""
 
 
@@ -382,7 +402,8 @@ def _listed(annotations: ToolAnnotations):
 
 # 힌트는 사용자 환경이나 외부 시스템이 바뀌는지를 본다.
 # 사용량 카운터와 가격 히스토리는 서버 내부 기록이라 읽기 전용·멱등이다.
-# 외부 API를 호출할 수 있는 도구는 search_products(네이버 쇼핑)뿐이다.
+# 외부 API를 호출할 수 있는 도구는 search_products(네이버 쇼핑)와
+# lookup_functional_food_filing(식품안전나라 I0030)뿐이다.
 @_listed(
     ToolAnnotations(
         title="상품 검색",
@@ -394,37 +415,75 @@ def _listed(annotations: ToolAnnotations):
 )
 @metered
 def search_products(keyword: str, limit: int = 10) -> str:
-    """Search products and return the matches {service}, lowest price first.
+    """Search products and return matches {service}, lowest recorded price first.
 
-    When both Naver Shopping API credentials are set, this calls Naver Shopping. If that call fails, the error is returned and the catalog is not used as a fallback. Otherwise it searches catalog.json for supplements and pet food by product name, brand, and keywords, and labels the source as static_catalog. Those prices are not live. If nothing matches, the result is not filled with other products.
+    With both Naver keys set, this calls Naver Shopping and does not fall back to the catalog if that call fails. Otherwise it searches catalog.json for supplements and pet food. A static price keeps the catalog date and is not a live price. A product URL is included only for a stored seller product page. Brand listings, price trackers, and search pages are reported as no product URL. If nothing matches, the result is not filled with other products.
 
-    keyword is the query. limit is the maximum number of results, default 10, clamped to 1 through 20. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
+    keyword is the query. limit is 1 through 20, default 10. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     limit = max(1, min(limit, 20))
+    queried_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if NAVER_ID and NAVER_SECRET:
         try:
             items = naver_search(keyword, limit)
             source = "naver_shopping_api"
         except Exception as e:
             return f"네이버 쇼핑 API 오류: {e}"
+        for product in items:
+            if product["price"]:
+                log_price(
+                    product_key_of(product["name"], product["mall"]),
+                    product["name"],
+                    product["price"],
+                    product["mall"],
+                )
+        items_sorted = sorted(items, key=lambda x: x["price"] or 10**18)
+        lines = [
+            f"[검색: {keyword}] (출처: {source})",
+            f"가격은 네이버 쇼핑 API 응답의 lprice이며 조회 시각은 {queried_at}이다. static_catalog 가격이 아니다.",
+        ]
+        url_lines = lambda product: product_links.remote_url_lines(product.get("url"))
     else:
         # 맞는 상품이 없어도 다른 카테고리로 채우지 않는다.
         items = _static_hits(keyword)[:limit]
         source = static_source_label()
+        for product in items:
+            if product["price"]:
+                log_price(
+                    product_key_of(product["name"], product["mall"]),
+                    product["name"],
+                    product["price"],
+                    product["mall"],
+                    catalog_observed_ts(product),
+                )
+        items_sorted = sorted(items, key=lambda x: x["price"] or 10**18)
+        lines = [
+            f"[검색: {keyword}] (출처: {source})",
+            (
+                f"가격 기준일: {STATIC_CHECKED_AT or '날짜없음'}. "
+                f"static_catalog에 적힌 가격이며, 이 조회 시각({queried_at})의 시세가 아니다."
+            ),
+        ]
+        url_lines = lambda product: product_links.catalog_url_lines(product.get("url"))
 
-    for p in items:
-        if p["price"]:
-            log_price(product_key_of(p["name"], p["mall"]), p["name"], p["price"], p["mall"])
-
-    items_sorted = sorted(items, key=lambda x: x["price"] or 10**18)
-    lines = [f"[검색: {keyword}] (출처: {source})"]
     if not items_sorted:
         lines.append("맞는 상품이 없어.")
         return "\n".join(lines)
-    for i, p in enumerate(items_sorted, 1):
-        mall = p.get("mall") or ""
-        lines.append(f"{i}. {p['name']} — {p['price']:,}원 ({mall}){_hit_suffix(p)}")
+    for index, product in enumerate(items_sorted, 1):
+        mall = product.get("mall") or ""
+        lines.append(f"{index}. {product['name']} — {product['price']:,}원 ({mall}){_hit_suffix(product)}")
+        lines.extend(url_lines(product))
     if items_sorted[0]["price"]:
-        lines.append(f"\n최저가: {items_sorted[0]['price']:,}원 ({items_sorted[0].get('mall') or ''})")
+        checked = items_sorted[0].get("checked_at") or STATIC_CHECKED_AT or ""
+        if source == "naver_shopping_api":
+            lines.append(
+                f"\n응답 가격 중 가장 낮음: {items_sorted[0]['price']:,}원 "
+                f"({items_sorted[0].get('mall') or ''}), 조회 시각 {queried_at}"
+            )
+        else:
+            lines.append(
+                f"\n기록 가격 중 가장 낮음: {items_sorted[0]['price']:,}원 "
+                f"({items_sorted[0].get('mall') or ''}), 기준일 {checked or '날짜없음'}"
+            )
     return "\n".join(lines)
 
 
@@ -441,27 +500,28 @@ def search_products(keyword: str, limit: int = 10) -> str:
 def check_price_timing(product_name: str, mall: str = "") -> str:
     """Compare the latest stored price with this server's recent history {service} and say whether it is low, typical, or high.
 
-    Prices come only from earlier searches recorded on this server. No external price API is called. With fewer than two records, the tool reports the count and does not guess. Otherwise it returns the current price, the 90-day low, the average, and one line: near the low when the current price is at or below 102 percent of the low, at or below the average, or the percent above the average.
+    Prices come only from earlier searches recorded on this server. No external price API is called. A static catalog row keeps its catalog date and is not a price observed at this call. With fewer than two records, the tool reports the count and does not guess. Otherwise it returns the latest recorded price and its record date, the 90-day low, the average, and one line: near the low when that price is at or below 102 percent of the low, at or below the average, or the percent above the average.
 
     product_name is the product name. mall is the seller. An empty mall matches only records stored with an empty seller. The lookup keeps letters and digits from the name and uses the first 30. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
     key = product_key_of(product_name, mall)
     st = price_stats(key)
     if not st or st["count"] < 2:
         return (
-            f"'{product_name}' 가격 데이터가 아직 {st['count'] if st else 0}건뿐이야. "
-            "며칠간 search_products로 가격을 모으면 타이밍 판단이 가능해져."
+            f"'{product_name}' 가격 기록이 {st['count'] if st else 0}건뿐이야. "
+            "같은 정적 카탈로그 가격을 다시 읽어도 새 관측으로 쌓이지 않아. "
+            "기록이 2건 미만이면 타이밍을 판단하지 않아."
         )
     cur, mn, avg = st["latest"], st["min"], st["avg"]
     if cur <= mn * 1.02:
-        verdict = "지금이 최근 90일 최저가 수준이야. 사기 좋은 타이밍."
+        verdict = "기록된 가격이 최근 90일 최저 기록과 같거나 2% 이내야."
     elif cur <= avg:
-        verdict = f"평균({avg:,}원)보다 싸. 무난하게 살 만해."
+        verdict = f"평균({avg:,}원)보다 낮은 기록이야."
     else:
         pct = round((cur - avg) / avg * 100)
-        verdict = f"평균보다 {pct}% 비싸. 급하지 않으면 며칠 기다려봐."
+        verdict = f"평균보다 {pct}% 높은 기록이야."
     return (
         f"[가격 타이밍: {product_name}]\n"
-        f"현재가 {cur:,}원 / 90일 최저 {mn:,}원 / 평균 {avg:,}원 "
+        f"최근 기록 {cur:,}원 (기록일 {st['latest_ts']}) / 90일 최저 {mn:,}원 / 평균 {avg:,}원 "
         f"(기록 {st['count']}건, {st['first_seen']}~)\n{verdict}"
     )
 
@@ -477,19 +537,39 @@ def check_price_timing(product_name: str, mall: str = "") -> str:
 )
 @metered
 def get_buy_link(product_url: str, product_name: str = "") -> str:
-    """Return a product URL {service}. This does not open the page, take payment, or suggest that anyone should buy.
+    """Return an evidenced seller product URL {service}. This does not open the page or take payment.
 
-    If the URL contains coupang.com and the server has an affiliate id, a partner_id query parameter is added. Otherwise the URL is returned unchanged.
+    The URL is returned only when catalog.json stores that same address as a seller product page. Brand listings, price trackers, search pages, and any other address are unavailable and are not turned into a product link. A partner_id parameter is added only to an evidenced coupang.com product page when an affiliate id is set.
 
-    product_url is the product address. product_name is optional and is not written into the URL. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
-    url = product_url
+    product_url is the address. product_name is optional and is not written into the URL. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
+    product = product_links.find_product_by_url(STATIC_PRODUCTS, product_url)
+    if product is None:
+        reason = product_links.unavailable_reason(product_url)
+        return f"Product link unavailable\n{reason}\nNo affiliate tag was added."
+    url = str(product.get("url") or "").strip()
     note = "No affiliate tag is configured. The original URL is returned unchanged."
-    if AFFILIATE_ID and "coupang.com" in url:
-        # 쿠팡 파트너스: 실제 운영 시 파트너스 API로 단축링크 생성 권장
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}partner_id={AFFILIATE_ID}"
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if AFFILIATE_ID and host.endswith("coupang.com"):
+        parsed = urllib.parse.urlparse(url)
+        pairs = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if key != "partner_id"
+        ]
+        pairs.append(("partner_id", AFFILIATE_ID))
+        url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(pairs)))
         note = "An affiliate tag was added to the URL."
-    return f"Product link\n{url}\n{note}"
+    elif AFFILIATE_ID:
+        note = "The original URL is returned unchanged."
+    checked = product.get("checked_at") or STATIC_CHECKED_AT or "날짜없음"
+    return (
+        "Product link\n"
+        f"{url}\n"
+        "source: static_catalog\n"
+        f"catalog_checked_at: {checked}\n"
+        "The catalog date is not the time of this call. The page was not opened.\n"
+        f"{note}"
+    )
 
 
 # ---------- 펫 버티컬 확장 ----------
@@ -586,21 +666,35 @@ def find_pet_food(pet: str, age: str = "", exclude_allergen: str = "",
 
     for p in results:
         if isinstance(p.get("price"), int) and p["price"]:
-            log_price(product_key_of(p["name"], p.get("mall") or ""), p["name"], p["price"], p.get("mall") or "")
+            log_price(
+                product_key_of(p["name"], p.get("mall") or ""),
+                p["name"],
+                p["price"],
+                p.get("mall") or "",
+                catalog_observed_ts(p),
+            )
 
     source = static_source_label()
     if not results:
-        return f"조건에 맞는 사료가 없어. 조건을 완화해봐. (출처: {source})"
-    lines = [f"[펫사료 검색: {pet} / {len(results)}건] (출처: {source})"]
+        return (
+            f"조건에 맞는 사료가 없어. 조건을 완화해봐. (출처: {source})\n"
+            "가격은 카탈로그 기준일이며 이 조회 시각의 시세가 아니다."
+        )
+    lines = [
+        f"[펫사료 검색: {pet} / {len(results)}건] (출처: {source})",
+        "가격은 카탈로그 기준일이며 이 조회 시각의 시세가 아니다.",
+    ]
     for i, p in enumerate(results, 1):
         gf = "그레인프리" if p.get("grain_free") else "곡물포함"
         ingredients = p.get("main_ingredients") or []
         ing = ", ".join(ingredients) if ingredients else "미확인"
+        price = f"{p['price']:,}원" if isinstance(p.get("price"), int) else "미확인"
         lines.append(
-            f"{i}. {p['name']} — {p['price']:,}원 ({p.get('mall') or ''})\n"
+            f"{i}. {p['name']} — {price} ({p.get('mall') or ''})\n"
             f"   단백질 {_num_text(p.get('protein'), '%')} / 지방 {_num_text(p.get('fat'), '%')} / "
             f"칼로리 {_num_text(p.get('kcal'), 'kcal/kg')} / {gf} / 주원료: {ing} / {_score_text(p)}"
         )
+        lines.extend(product_links.catalog_url_lines(p.get("url")))
     return "\n".join(lines)
 
 
@@ -679,6 +773,52 @@ def get_usage() -> str:
     if view is None:
         raise RuntimeError("사용량 컨텍스트가 없습니다.")
     return json.dumps(view.to_dict(), ensure_ascii=False)
+
+
+def _filing_error(err: functional_food.FilingError, report_no: str | None = None) -> CallToolResult:
+    payload = functional_food.error_payload(err, report_no)
+    text = json.dumps(payload, ensure_ascii=False)
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={"result": text},
+        isError=True,
+    )
+
+
+@_listed(
+    ToolAnnotations(
+        title="품목신고 조회",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+)
+@metered
+def lookup_functional_food_filing(report_no: str) -> str:
+    """Look up one health functional food filing by the exact 품목제조번호 {service}.
+
+    Calls MFDS FoodSafetyKorea service I0030. The number is matched as text, so leading zeroes stay. Names and brands are not searched. Present filing fields are returned, empty fields are listed, and the documentation URL and query time are included. Price and a purchase URL are not in this source. The filing text is not an efficacy finding, personal advice, or a government endorsement.
+
+    report_no is the 품목제조번호. Set FOODSAFETYKOREA_API_KEY on the server. If it is empty, the tool returns filing_api_unconfigured and does not invent a filing. The call requires this server's API key. A missing, invalid, or expired key is rejected and is not counted. A key over its monthly quota returns an error and is not counted."""
+    key = os.environ.get(functional_food.ENV_NAME, "")
+    shown = report_no if isinstance(report_no, str) and len(report_no) <= 64 else None
+    try:
+        report = functional_food.validate_report_no(report_no)
+    except functional_food.FilingError as err:
+        return _filing_error(err, shown)
+    if not key.strip():
+        return _filing_error(functional_food.unconfigured_error(), report)
+    try:
+        payload = functional_food.fetch_i0030(report, key.strip())
+    except functional_food.FilingError as err:
+        return _filing_error(err, report)
+    except Exception:
+        return _filing_error(
+            functional_food.FilingError("upstream_error", "공식 API 호출에 실패했다."),
+            report,
+        )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.custom_route("/health", methods=["GET"])

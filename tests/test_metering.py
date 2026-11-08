@@ -211,6 +211,13 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
                 "idempotentHint": True,
                 "openWorldHint": False,
             },
+            "lookup_functional_food_filing": {
+                "title": "품목신고 조회",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": True,
+            },
             "get_usage": {
                 "title": "사용량 조회",
                 "readOnlyHint": True,
@@ -480,28 +487,46 @@ class ToolMeteringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_buy_link_response_does_not_push_a_purchase(self):
         previous = server.AFFILIATE_ID
+        product = next(
+            item for item in server.STATIC_PRODUCTS if "/vp/products/" in (item.get("url") or "")
+        )
+        listing = next(
+            item for item in server.STATIC_PRODUCTS if "brand-shop" in (item.get("url") or "")
+        )
         try:
             server.AFFILIATE_ID = ""
             async with self._session() as client:
-                plain = await client.call_tool(
+                plain = await client.call_tool("get_buy_link", {"product_url": product["url"]})
+                self.assertFalse(plain.isError, plain)
+                text = plain.content[0].text
+                self.assertIn(product["url"], text)
+                self.assertIn("original URL is returned unchanged", text)
+                self.assertIn("static_catalog", text)
+                self.assertNotRegex(text, r"구매|buy now|구매하세요|지금 사")
+
+                unknown = await client.call_tool(
                     "get_buy_link",
                     {"product_url": "https://example.com/item"},
                 )
-                self.assertFalse(plain.isError, plain)
-                text = plain.content[0].text
-                self.assertIn("https://example.com/item", text)
-                self.assertIn("original URL is returned unchanged", text)
-                self.assertNotRegex(text, r"구매|buy now|구매하세요|지금 사")
+                unknown_text = unknown.content[0].text
+                self.assertIn("Product link unavailable", unknown_text)
+                self.assertNotIn("https://example.com/item", unknown_text)
+                self.assertNotRegex(unknown_text, r"구매|buy now|구매하세요|지금 사")
 
                 server.AFFILIATE_ID = "partner"
-                tagged = await client.call_tool(
-                    "get_buy_link",
-                    {"product_url": "https://www.coupang.com/vp/products/1"},
-                )
-            tagged_text = tagged.content[0].text
-            self.assertIn("partner_id=partner", tagged_text)
-            self.assertIn("An affiliate tag was added to the URL.", tagged_text)
-            self.assertNotRegex(tagged_text, r"구매|buy now|구매하세요|지금 사")
+                tagged = await client.call_tool("get_buy_link", {"product_url": product["url"]})
+                tagged_text = tagged.content[0].text
+                self.assertIn("partner_id=partner", tagged_text)
+                self.assertIn(product["url"].split("?", 1)[0], tagged_text)
+                self.assertIn("An affiliate tag was added to the URL.", tagged_text)
+                self.assertNotRegex(tagged_text, r"구매|buy now|구매하세요|지금 사")
+
+                blocked = await client.call_tool("get_buy_link", {"product_url": listing["url"]})
+                blocked_text = blocked.content[0].text
+                self.assertIn("Product link unavailable", blocked_text)
+                self.assertIn("brand listing", blocked_text)
+                self.assertNotIn("brand-shop", blocked_text)
+                self.assertNotIn("partner_id", blocked_text)
         finally:
             server.AFFILIATE_ID = previous
 
@@ -675,9 +700,18 @@ class HttpToolAuthTests(unittest.TestCase):
                 "tools/call",
                 _tool_call("search_products", {"keyword": "비타민"}),
             )
+            filing = _rpc(
+                client,
+                "tools/call",
+                _tool_call("lookup_functional_food_filing", {"report_no": "201100200015"}),
+            )
         self.assertEqual(denied.status_code, 401)
         self.assertEqual(denied.json()["error"], "missing_api_key")
         self.assertEqual(denied.json()["tool"], "search_products")
+        self.assertEqual(filing.status_code, 401)
+        self.assertEqual(filing.json()["error"], "missing_api_key")
+        self.assertEqual(filing.json()["tool"], "lookup_functional_food_filing")
+        self.assertIn("Bearer", filing.headers["www-authenticate"])
         challenge = denied.headers["www-authenticate"]
         self.assertIn('Bearer', challenge)
         self.assertIn('error="invalid_request"', challenge)

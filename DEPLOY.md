@@ -41,6 +41,7 @@
    - `MCP_KEY_QUOTAS` (선택, `키:한도` 를 쉼표로 연결. 예: `dev-demo-key:100`)
    - `MCP_USAGE_DB_PATH` (선택. 생략 시 앱 디렉터리 `usage.db`. 무료 디스크는 재시작 시 삭제)
    - `MCP_API_KEY`는 넣지 않는다. 로컬 stdio 전용이라 HTTP 호출자를 인증하지 않는다.
+   - `FOODSAFETYKOREA_API_KEY` (선택, 건강기능식품 품목신고 조회. 발급 절차는 README)
 6. 값을 저장한 뒤 수동 배포 또는 재시작해야 프로세스에 반영된다.
 7. 배포 후
    - MCP: `https://<서비스명>.onrender.com/mcp`
