@@ -20,6 +20,7 @@ METERED_TOOLS = (
     "get_buy_link",
     "find_pet_food",
     "compare_nutrition",
+    "lookup_functional_food_filing",
 )
 
 DEFAULT_MONTHLY_QUOTA = 1000
