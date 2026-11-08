@@ -16,9 +16,13 @@ AI 에이전트가 호출하는 쇼핑 도구 서버. 에이전트가 이 서버
 
 ## API 키와 호출 미터링
 
-도구를 호출하려면 API 키가 필요하다. 키 없는 호출은 빈 결과가 아니라
-`missing_api_key` / `invalid_api_key` / `quota_exceeded` 같은 구조화된 오류로 거절된다.
-`initialize`와 도구 목록 조회, `GET /health`는 키 없이 된다.
+도구를 호출하려면 API 키가 필요하다. HTTP `tools/call`에서 키가 없거나(`missing_api_key`),
+등록되지 않았거나(`invalid_api_key`), 만료되었으면(`expired_api_key`) 응답은 HTTP 401이고
+`WWW-Authenticate: Bearer`를 포함한다. 본문은 같은 오류 JSON이다.
+한도를 넘긴 호출은 키가 유효하므로 기존처럼 HTTP 200의 도구 오류 `quota_exceeded`이다.
+stdio처럼 HTTP가 아닌 호출은 상태 코드가 없어 같은 오류 JSON을 도구 결과로 돌려준다.
+`initialize`, `tools/list`, `GET /health`는 키 없이 된다.
+Streamable HTTP는 세션을 저장하지 않는다. `Mcp-Session-Id` 없이 요청마다 호출할 수 있다.
 결제는 아직 없다. 운영자가 환경변수로 키를 넣고, 키마다 월간 무료 한도를 둔다.
 
 ### 빌더가 키를 받는 방법

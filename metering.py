@@ -24,7 +24,16 @@ METERED_TOOLS = (
 
 DEFAULT_MONTHLY_QUOTA = 1000
 
+# HTTP tools/call maps these to 401. Quota and server_unconfigured stay tool results.
+AUTH_FAILURE_CODES = frozenset({"missing_api_key", "invalid_api_key", "expired_api_key"})
+
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def _as_utc(moment: datetime) -> datetime:
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 class MeterError(Exception):
@@ -217,9 +226,11 @@ class UsageMeter:
         db_path: str,
         keys: dict[str, int],
         clock: Callable[[], datetime] | None = None,
+        expires_at: Mapping[str, datetime] | None = None,
     ):
         self.db_path = db_path
         self.keys = dict(keys)
+        self.expires_at = dict(expires_at or {})
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._ensure_schema()
 
@@ -269,7 +280,27 @@ class UsageMeter:
                 "invalid_api_key",
                 "등록되지 않은 API 키입니다. 서버의 MCP_API_KEYS에 포함된 키만 사용할 수 있습니다.",
             )
+        expiry = self.expires_at.get(raw_key)
+        if expiry is not None and _as_utc(self._now()) >= _as_utc(expiry):
+            raise MeterError(
+                "expired_api_key",
+                "만료된 API 키입니다. 서버 운영자에게 새 키를 요청하세요.",
+            )
         return raw_key, quota, key_fingerprint(raw_key)
+
+    def auth_failure(self, raw_key: str | None) -> MeterError | None:
+        """Return a missing, invalid, or expired key error.
+
+        Does not read or increment quota. An unconfigured server returns None
+        so the tool can keep reporting server_unconfigured.
+        """
+        try:
+            self._require_key(raw_key)
+        except MeterError as err:
+            if err.code in AUTH_FAILURE_CODES:
+                return err
+            return None
+        return None
 
     def _read_calls(self, con: sqlite3.Connection, key_id: str, period: str) -> int:
         row = con.execute(
@@ -366,6 +397,7 @@ def reset_meter(
     db_path: str | None = None,
     keys: dict[str, int] | None = None,
     clock: Callable[[], datetime] | None = None,
+    expires_at: Mapping[str, datetime] | None = None,
 ) -> UsageMeter:
     """Replace the process-wide meter. Tests pass an explicit db and key map."""
     global _meter
@@ -373,5 +405,5 @@ def reset_meter(
         env_path, env_keys = config_from_env()
         db_path = db_path or env_path
         keys = env_keys if keys is None else keys
-    _meter = UsageMeter(db_path, keys, clock=clock)
+    _meter = UsageMeter(db_path, keys, clock=clock, expires_at=expires_at)
     return _meter
